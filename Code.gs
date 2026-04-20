@@ -17,11 +17,6 @@ var CONFIG = {
 
   API_BASE: 'https://api.openphone.com/v1',
 
-  // Google Cloud Translation API key (for language detection).
-  // Set in Script Properties as GOOGLE_TRANSLATE_API_KEY. If blank, the script
-  // falls back to a lightweight keyword-based detector.
-  GOOGLE_TRANSLATE_API_KEY: PropertiesService.getScriptProperties().getProperty('GOOGLE_TRANSLATE_API_KEY') || '',
-
   // Name of the sheet tab to use (created automatically if missing)
   SHEET_NAME: 'Quo Contacts',
 
@@ -827,105 +822,79 @@ function getPrimaryEmail(emails) {
  * otherwise falls back to a lightweight keyword-based heuristic.
  * Returns 'English', 'Spanish', or '' if unclear.
  */
+/**
+ * Detects the language of a text sample. Returns 'English', 'Spanish', or ''.
+ * Uses the free Google Translate auto-detect endpoint (no API key needed),
+ * falls back to a keyword heuristic if the request fails.
+ */
 function detectLanguage(text) {
   if (!text || typeof text !== 'string') return '';
   var trimmed = text.trim();
   if (trimmed.length < 2) return '';
 
-  // Prefer the Google Translation API if configured.
-  if (CONFIG.GOOGLE_TRANSLATE_API_KEY) {
-    var apiResult = detectLanguageViaGoogle(trimmed);
-    if (apiResult) return apiResult;
-    // Fall through to the heuristic if the API call failed.
-  }
+  // Try the free Google Translate endpoint first
+  var googleResult = detectLanguageViaGoogleTranslate(trimmed);
+  if (googleResult !== null) return googleResult;
 
+  // Fallback: keyword heuristic
   return detectLanguageHeuristic(trimmed);
 }
 
 /**
- * Calls Google Cloud Translation API v2 detect endpoint.
- * Returns 'English', 'Spanish', '' for unknown/other, or null on failure.
- *
- * Setup:
- *   1. In Google Cloud Console, enable the Cloud Translation API on a project
- *      with billing enabled (there's a free monthly quota).
- *   2. Create an API key under APIs & Services → Credentials.
- *   3. Restrict the key to the Cloud Translation API for safety.
- *   4. Store it in Script Properties as GOOGLE_TRANSLATE_API_KEY.
+ * Uses the free Google Translate auto-detect endpoint.
+ * No API key or billing required — same endpoint the Google Translate site uses.
+ * Returns 'English', 'Spanish', '' for other languages, or null on failure.
  */
-function detectLanguageViaGoogle(text) {
-  var url = 'https://translation.googleapis.com/language/translate/v2/detect?key='
-            + encodeURIComponent(CONFIG.GOOGLE_TRANSLATE_API_KEY);
-
-  var options = {
-    method: 'post',
-    contentType: 'application/x-www-form-urlencoded',
-    payload: { q: text.substring(0, 1000) },  // cap payload size per call
-    muteHttpExceptions: true
-  };
+function detectLanguageViaGoogleTranslate(text) {
+  // Cap at 500 chars — plenty for detection, keeps the URL safe
+  var snippet = text.substring(0, 500);
+  var url = 'https://translate.googleapis.com/translate_a/single'
+          + '?client=gtx&sl=auto&tl=en&dt=t&q=' + encodeURIComponent(snippet);
 
   try {
-    var response = UrlFetchApp.fetch(url, options);
+    var response = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
     if (response.getResponseCode() !== 200) {
-      Logger.log('Google detect API error ' + response.getResponseCode()
-                 + ': ' + response.getContentText().substring(0, 200));
+      Logger.log('Google Translate detect returned ' + response.getResponseCode());
       return null;
     }
-    var body = JSON.parse(response.getContentText());
-    var detections = body && body.data && body.data.detections;
-    if (!detections || !detections.length || !detections[0].length) return '';
-    var lang = (detections[0][0].language || '').toLowerCase();
+    // Response is a nested JSON array. The detected language code is at index [2].
+    var result = JSON.parse(response.getContentText());
+    var lang = (result[2] || '').toLowerCase();
     if (lang === 'es') return 'Spanish';
     if (lang === 'en') return 'English';
-    return ''; // other languages — leave blank rather than guessing
+    return '';
   } catch (e) {
-    Logger.log('Google detect exception: ' + e.message);
+    Logger.log('Google Translate detect exception: ' + e.message);
     return null;
   }
 }
 
 /**
  * Fallback keyword-based detector. Returns 'Spanish', 'English', or ''.
- * Tune SPANISH_WORDS / ENGLISH_WORDS below to improve accuracy for your data.
  */
 function detectLanguageHeuristic(text) {
   var sample = text.toLowerCase();
 
-  // Spanish-specific characters are a strong signal
   if (/[ñáéíóúü¿¡]/.test(sample)) return 'Spanish';
 
-  var SPANISH_WORDS = [
+  var SPANISH = [
     ' el ', ' la ', ' los ', ' las ', ' de ', ' que ', ' no ', ' si ',
     ' una ', ' uno ', ' por ', ' para ', ' con ', ' sin ', ' pero ',
-    ' hola ', ' gracias ', ' buenos ', ' buenas ', ' dias ', ' tardes ',
-    ' llamar ', ' llamada ', ' mensaje ', ' necesito ', ' puede ', ' cuando ',
-    ' donde ', ' como ', ' mi ', ' tu ', ' yo ', ' soy ', ' estoy ', ' esta '
+    ' hola ', ' gracias ', ' buenos ', ' buenas ', ' necesito ', ' puede '
+  ];
+  var ENGLISH = [
+    ' the ', ' a ', ' an ', ' is ', ' are ', ' was ', ' and ', ' or ',
+    ' but ', ' to ', ' of ', ' in ', ' for ', ' with ', ' you ', ' your ',
+    ' hello ', ' hi ', ' thanks ', ' please ', ' call ', ' need '
   ];
 
-  var ENGLISH_WORDS = [
-    ' the ', ' a ', ' an ', ' is ', ' are ', ' was ', ' were ', ' be ',
-    ' and ', ' or ', ' but ', ' if ', ' to ', ' of ', ' in ', ' on ',
-    ' for ', ' with ', ' you ', ' your ', ' my ', ' i ', ' we ',
-    ' hello ', ' hi ', ' thanks ', ' thank ', ' please ', ' call ',
-    ' message ', ' need ', ' can ', ' could ', ' would ', ' when ',
-    ' where ', ' how ', ' what '
-  ];
-
-  // Pad with spaces so single-word edge cases still match
   var padded = ' ' + sample.replace(/[^\w\s]/g, ' ') + ' ';
+  var es = 0, en = 0;
+  for (var i = 0; i < SPANISH.length; i++) { if (padded.indexOf(SPANISH[i]) !== -1) es++; }
+  for (var j = 0; j < ENGLISH.length; j++) { if (padded.indexOf(ENGLISH[j]) !== -1) en++; }
 
-  var spanishScore = 0;
-  for (var i = 0; i < SPANISH_WORDS.length; i++) {
-    if (padded.indexOf(SPANISH_WORDS[i]) !== -1) spanishScore++;
-  }
-
-  var englishScore = 0;
-  for (var j = 0; j < ENGLISH_WORDS.length; j++) {
-    if (padded.indexOf(ENGLISH_WORDS[j]) !== -1) englishScore++;
-  }
-
-  if (spanishScore === 0 && englishScore === 0) return '';
-  if (spanishScore > englishScore) return 'Spanish';
-  if (englishScore > spanishScore) return 'English';
-  return ''; // tie → unclear
+  if (es === 0 && en === 0) return '';
+  if (es > en) return 'Spanish';
+  if (en > es) return 'English';
+  return '';
 }
