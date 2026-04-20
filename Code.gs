@@ -57,13 +57,14 @@ var HEADERS = [
   'Last Voicemail At',             // R  (18)
   'Last Inbound Voicemail At',     // S  (19)
   'Last Outbound Voicemail At',    // T  (20)
-  'Last Voicemail Transcript',     // U  (21)
-  'Last Any Call At',              // V  (22)
-  'Last Any Contact At',           // W  (23)
-  'Last Contact Type',             // X  (24)
-  'Last Contact Direction',        // Y  (25)
-  'Days Since Last Contact',       // Z  (26)
-  'Last Sync At'                   // AA (27)
+  'Last Language Used',            // U  (21)
+  'Last Outbound Call At',         // V  (22)
+  'Last Any Call At',              // W  (23)
+  'Last Any Contact At',           // X  (24)
+  'Last Contact Type',             // Y  (25)
+  'Last Contact Direction',        // Z  (26)
+  'Days Since Last Contact',       // AA (27)
+  'Last Sync At'                   // AB (28)
 ];
 
 // Column index lookup (0-based)
@@ -432,6 +433,7 @@ function fetchAllCallsForAllNumbers(phoneNumberIds) {
 function fetchTextActivityForContact(normalizedPhone, phoneNumberIds) {
   var lastInbound = '';
   var lastOutbound = '';
+  var lastInboundText = '';  // content of most recent inbound text (for language detection)
 
   for (var i = 0; i < phoneNumberIds.length; i++) {
     var params = {
@@ -454,13 +456,19 @@ function fetchTextActivityForContact(normalizedPhone, phoneNumberIds) {
 
       if (dir === 'incoming' && ts > lastInbound) {
         lastInbound = ts;
+        // ── FIELD MAPPING: message body field is `text` on the Quo API ──
+        lastInboundText = msg.text || '';
       } else if (dir === 'outgoing' && ts > lastOutbound) {
         lastOutbound = ts;
       }
     }
   }
 
-  return { lastInbound: lastInbound, lastOutbound: lastOutbound };
+  return {
+    lastInbound: lastInbound,
+    lastOutbound: lastOutbound,
+    lastInboundText: lastInboundText
+  };
 }
 
 /**
@@ -537,8 +545,10 @@ function classifyCalls(calls, voicemailCache) {
     lastSonaOutbound: '',
     lastVoicemailInbound: '',
     lastVoicemailOutbound: '',
-    lastVoicemailTranscript: '',
-    lastVoicemailAt: ''  // track the timestamp of the transcript we keep
+    // Most recent INBOUND voicemail transcript — used only for language detection.
+    // We care about what the contact said, not what we said.
+    lastInboundVoicemailTranscript: '',
+    lastInboundVoicemailAt: ''
   };
 
   for (var i = 0; i < calls.length; i++) {
@@ -556,15 +566,14 @@ function classifyCalls(calls, voicemailCache) {
       var vmData = voicemailCache[call.id];
       if (dir === 'incoming' && ts > result.lastVoicemailInbound) {
         result.lastVoicemailInbound = ts;
+        // Keep the most recent inbound transcript for language detection
+        if (ts > result.lastInboundVoicemailAt) {
+          result.lastInboundVoicemailAt = ts;
+          result.lastInboundVoicemailTranscript = vmData.transcript || '';
+        }
       }
       if (dir === 'outgoing' && ts > result.lastVoicemailOutbound) {
         result.lastVoicemailOutbound = ts;
-      }
-      // Keep the transcript from the most recent voicemail overall
-      var vmTs = ts;
-      if (vmTs > result.lastVoicemailAt) {
-        result.lastVoicemailAt = vmTs;
-        result.lastVoicemailTranscript = vmData.transcript;
       }
     }
 
@@ -640,6 +649,15 @@ function buildContactRow(contactId, name, company, primaryPhone, email,
     classified.lastVoicemailOutbound
   ]);
 
+  // Rollup: Last Outbound Call At — any outbound call attempt
+  // (completed, missed, Sona, or voicemail we left).
+  var lastOutboundCall = latestOf([
+    classified.lastCompletedOutbound,
+    classified.lastMissedOutbound,
+    classified.lastSonaOutbound,
+    classified.lastVoicemailOutbound
+  ]);
+
   // Rollup: Last Any Call At (completed human + missed + sona + voicemail)
   var lastAnyCall = latestOf([
     lastCompletedHumanCall,
@@ -650,6 +668,16 @@ function buildContactRow(contactId, name, company, primaryPhone, email,
 
   // Rollup: Last Any Contact At (calls + texts)
   var lastAnyContact = latestOf([lastAnyCall, lastText]);
+
+  // Language detection — pick the most recent inbound sample from the contact.
+  // Voicemail transcript vs inbound text; whichever is more recent wins.
+  var languageSample = '';
+  if (classified.lastInboundVoicemailAt > textActivity.lastInbound) {
+    languageSample = classified.lastInboundVoicemailTranscript;
+  } else {
+    languageSample = textActivity.lastInboundText || classified.lastInboundVoicemailTranscript;
+  }
+  var lastLanguageUsed = detectLanguage(languageSample);
 
   // Determine Last Contact Type and Direction
   var lastContactInfo = determineLastContactType(classified, textActivity, lastAnyContact);
@@ -684,7 +712,8 @@ function buildContactRow(contactId, name, company, primaryPhone, email,
   row[COL['Last Voicemail At']]                = lastVoicemail;
   row[COL['Last Inbound Voicemail At']]        = classified.lastVoicemailInbound;
   row[COL['Last Outbound Voicemail At']]       = classified.lastVoicemailOutbound;
-  row[COL['Last Voicemail Transcript']]        = classified.lastVoicemailTranscript;
+  row[COL['Last Language Used']]               = lastLanguageUsed;
+  row[COL['Last Outbound Call At']]            = lastOutboundCall;
   row[COL['Last Any Call At']]                 = lastAnyCall;
   row[COL['Last Any Contact At']]              = lastAnyContact;
   row[COL['Last Contact Type']]                = lastContactInfo.type;
@@ -785,4 +814,54 @@ function getPrimaryPhone(phoneNumbers) {
 function getPrimaryEmail(emails) {
   if (!emails || !Array.isArray(emails) || emails.length === 0) return '';
   return emails[0].value || '';
+}
+
+/**
+ * Very lightweight English/Spanish language detector.
+ * Scans a text sample for Spanish-specific characters and common stopwords
+ * vs English stopwords, and returns 'Spanish', 'English', or '' if unclear.
+ *
+ * Tune SPANISH_WORDS / ENGLISH_WORDS below to improve accuracy for your data.
+ */
+function detectLanguage(text) {
+  if (!text || typeof text !== 'string') return '';
+  var sample = text.toLowerCase();
+
+  // Spanish-specific characters are a strong signal
+  if (/[ñáéíóúü¿¡]/.test(sample)) return 'Spanish';
+
+  var SPANISH_WORDS = [
+    ' el ', ' la ', ' los ', ' las ', ' de ', ' que ', ' no ', ' si ',
+    ' una ', ' uno ', ' por ', ' para ', ' con ', ' sin ', ' pero ',
+    ' hola ', ' gracias ', ' buenos ', ' buenas ', ' dias ', ' tardes ',
+    ' llamar ', ' llamada ', ' mensaje ', ' necesito ', ' puede ', ' cuando ',
+    ' donde ', ' como ', ' mi ', ' tu ', ' yo ', ' soy ', ' estoy ', ' esta '
+  ];
+
+  var ENGLISH_WORDS = [
+    ' the ', ' a ', ' an ', ' is ', ' are ', ' was ', ' were ', ' be ',
+    ' and ', ' or ', ' but ', ' if ', ' to ', ' of ', ' in ', ' on ',
+    ' for ', ' with ', ' you ', ' your ', ' my ', ' i ', ' we ',
+    ' hello ', ' hi ', ' thanks ', ' thank ', ' please ', ' call ',
+    ' message ', ' need ', ' can ', ' could ', ' would ', ' when ',
+    ' where ', ' how ', ' what '
+  ];
+
+  // Pad with spaces so single-word edge cases still match
+  var padded = ' ' + sample.replace(/[^\w\s]/g, ' ') + ' ';
+
+  var spanishScore = 0;
+  for (var i = 0; i < SPANISH_WORDS.length; i++) {
+    if (padded.indexOf(SPANISH_WORDS[i]) !== -1) spanishScore++;
+  }
+
+  var englishScore = 0;
+  for (var j = 0; j < ENGLISH_WORDS.length; j++) {
+    if (padded.indexOf(ENGLISH_WORDS[j]) !== -1) englishScore++;
+  }
+
+  if (spanishScore === 0 && englishScore === 0) return '';
+  if (spanishScore > englishScore) return 'Spanish';
+  if (englishScore > spanishScore) return 'English';
+  return ''; // tie → unclear
 }
