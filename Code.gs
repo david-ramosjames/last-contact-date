@@ -17,6 +17,11 @@ var CONFIG = {
 
   API_BASE: 'https://api.openphone.com/v1',
 
+  // Google Cloud Translation API key (for language detection).
+  // Set in Script Properties as GOOGLE_TRANSLATE_API_KEY. If blank, the script
+  // falls back to a lightweight keyword-based detector.
+  GOOGLE_TRANSLATE_API_KEY: PropertiesService.getScriptProperties().getProperty('GOOGLE_TRANSLATE_API_KEY') || '',
+
   // Name of the sheet tab to use (created automatically if missing)
   SHEET_NAME: 'Quo Contacts',
 
@@ -817,14 +822,73 @@ function getPrimaryEmail(emails) {
 }
 
 /**
- * Very lightweight English/Spanish language detector.
- * Scans a text sample for Spanish-specific characters and common stopwords
- * vs English stopwords, and returns 'Spanish', 'English', or '' if unclear.
- *
- * Tune SPANISH_WORDS / ENGLISH_WORDS below to improve accuracy for your data.
+ * Detects the language of a text sample.
+ * Uses Google Cloud Translation API when GOOGLE_TRANSLATE_API_KEY is configured,
+ * otherwise falls back to a lightweight keyword-based heuristic.
+ * Returns 'English', 'Spanish', or '' if unclear.
  */
 function detectLanguage(text) {
   if (!text || typeof text !== 'string') return '';
+  var trimmed = text.trim();
+  if (trimmed.length < 2) return '';
+
+  // Prefer the Google Translation API if configured.
+  if (CONFIG.GOOGLE_TRANSLATE_API_KEY) {
+    var apiResult = detectLanguageViaGoogle(trimmed);
+    if (apiResult) return apiResult;
+    // Fall through to the heuristic if the API call failed.
+  }
+
+  return detectLanguageHeuristic(trimmed);
+}
+
+/**
+ * Calls Google Cloud Translation API v2 detect endpoint.
+ * Returns 'English', 'Spanish', '' for unknown/other, or null on failure.
+ *
+ * Setup:
+ *   1. In Google Cloud Console, enable the Cloud Translation API on a project
+ *      with billing enabled (there's a free monthly quota).
+ *   2. Create an API key under APIs & Services → Credentials.
+ *   3. Restrict the key to the Cloud Translation API for safety.
+ *   4. Store it in Script Properties as GOOGLE_TRANSLATE_API_KEY.
+ */
+function detectLanguageViaGoogle(text) {
+  var url = 'https://translation.googleapis.com/language/translate/v2/detect?key='
+            + encodeURIComponent(CONFIG.GOOGLE_TRANSLATE_API_KEY);
+
+  var options = {
+    method: 'post',
+    contentType: 'application/x-www-form-urlencoded',
+    payload: { q: text.substring(0, 1000) },  // cap payload size per call
+    muteHttpExceptions: true
+  };
+
+  try {
+    var response = UrlFetchApp.fetch(url, options);
+    if (response.getResponseCode() !== 200) {
+      Logger.log('Google detect API error ' + response.getResponseCode()
+                 + ': ' + response.getContentText().substring(0, 200));
+      return null;
+    }
+    var body = JSON.parse(response.getContentText());
+    var detections = body && body.data && body.data.detections;
+    if (!detections || !detections.length || !detections[0].length) return '';
+    var lang = (detections[0][0].language || '').toLowerCase();
+    if (lang === 'es') return 'Spanish';
+    if (lang === 'en') return 'English';
+    return ''; // other languages — leave blank rather than guessing
+  } catch (e) {
+    Logger.log('Google detect exception: ' + e.message);
+    return null;
+  }
+}
+
+/**
+ * Fallback keyword-based detector. Returns 'Spanish', 'English', or ''.
+ * Tune SPANISH_WORDS / ENGLISH_WORDS below to improve accuracy for your data.
+ */
+function detectLanguageHeuristic(text) {
   var sample = text.toLowerCase();
 
   // Spanish-specific characters are a strong signal
