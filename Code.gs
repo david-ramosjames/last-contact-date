@@ -25,6 +25,11 @@ var CONFIG = {
   CALLS_PAGE_SIZE: 100,     // API max for calls is 100
   MESSAGES_PAGE_SIZE: 50,   // conservative default for messages
 
+  // How many contact phone numbers to include per /calls or /messages request.
+  // Both endpoints require `participants` as an array; batching keeps total
+  // request count low while staying under URL length limits.
+  PARTICIPANTS_BATCH_SIZE: 20,
+
   // Retry / rate-limit settings
   MAX_RETRIES: 4,
   INITIAL_BACKOFF_MS: 1000,
@@ -115,19 +120,35 @@ function syncQuoContactsToSheet() {
   var contacts = fetchAllContacts();
   Logger.log('Total contacts fetched: ' + contacts.length);
 
-  // 5. Fetch all calls across all phone numbers
-  var allCalls = fetchAllCallsForAllNumbers(phoneNumberIds);
+  // 5. Pre-extract normalized phone numbers for all contacts.
+  //    Both /calls and /messages require `participants`, so we need the full
+  //    list upfront to batch requests.
+  var allContactPhones = [];
+  for (var c = 0; c < contacts.length; c++) {
+    var phone = getPrimaryPhone((contacts[c].defaultFields || {}).phoneNumbers);
+    var np = normalizePhone(phone);
+    if (np) allContactPhones.push(np);
+  }
+  // Deduplicate
+  allContactPhones = Array.from(new Set(allContactPhones));
+  Logger.log('Unique contact phone numbers: ' + allContactPhones.length);
+
+  // 6. Fetch all calls and messages in batched requests
+  var allCalls = fetchAllCallsBatched(phoneNumberIds, allContactPhones);
   Logger.log('Total calls fetched: ' + allCalls.length);
 
-  // 6. Build a map of phone number → calls for fast lookup
-  var callsByPhone = indexCallsByParticipant(allCalls);
+  var allMessages = fetchAllMessagesBatched(phoneNumberIds, allContactPhones);
+  Logger.log('Total messages fetched: ' + allMessages.length);
 
-  // 7. Fetch voicemail details for missed calls that might have voicemails
-  //    We check every missed call for voicemail data.
+  // 7. Build lookup maps keyed by participant phone
+  var callsByPhone = indexCallsByParticipant(allCalls);
+  var messagesByPhone = indexMessagesByContactPhone(allMessages);
+
+  // 8. Fetch voicemails for missed calls (those are the ones likely to have one)
   var voicemailCache = fetchVoicemailsForCalls(allCalls);
   Logger.log('Voicemails fetched: ' + Object.keys(voicemailCache).length);
 
-  // 8. Process each contact: build/update their row
+  // 9. Process each contact: build/update their row
   var rowsToWrite = [];
   var contactIdOrder = [];
 
@@ -143,25 +164,18 @@ function syncQuoContactsToSheet() {
     var lastName = df.lastName || '';
     var name = (firstName + ' ' + lastName).trim();
     var company = df.company || '';
-    var primaryPhone = getPrimaryPhone(df.phoneNumbers);  // first phone number
-    var email = getPrimaryEmail(df.emails);                // first email
+    var primaryPhone = getPrimaryPhone(df.phoneNumbers);
+    var email = getPrimaryEmail(df.emails);
 
-    // Normalize phone for matching calls/messages
     var normalizedPhone = normalizePhone(primaryPhone);
 
-    // Get calls for this contact's phone number
+    // Look up pre-fetched activity for this contact
     var contactCalls = normalizedPhone ? (callsByPhone[normalizedPhone] || []) : [];
+    var contactMessages = normalizedPhone ? (messagesByPhone[normalizedPhone] || []) : [];
 
-    // Classify calls
     var classified = classifyCalls(contactCalls, voicemailCache);
+    var textActivity = computeTextActivityFromMessages(contactMessages);
 
-    // Fetch text messages for this contact (requires phone number + phoneNumberIds)
-    var textActivity = { lastInbound: '', lastOutbound: '' };
-    if (normalizedPhone && phoneNumberIds.length > 0) {
-      textActivity = fetchTextActivityForContact(normalizedPhone, phoneNumberIds);
-    }
-
-    // Compute all rollup fields
     var row = buildContactRow(contactId, name, company, primaryPhone, email,
                               classified, textActivity, startTime);
 
@@ -406,62 +420,107 @@ function fetchAllContacts() {
 }
 
 /**
- * Fetches all calls for all phone number IDs.
- * Returns a flat array of call objects.
+ * Fetches all calls for every combination of (phoneNumberId × participants batch).
+ * The /calls endpoint requires both `phoneNumberId` and `participants` (array),
+ * so we chunk the contact phone list into batches to keep request count low.
  */
-function fetchAllCallsForAllNumbers(phoneNumberIds) {
+function fetchAllCallsBatched(phoneNumberIds, contactPhones) {
   var allCalls = [];
+  if (phoneNumberIds.length === 0 || contactPhones.length === 0) return allCalls;
 
-  for (var i = 0; i < phoneNumberIds.length; i++) {
-    var params = { phoneNumberId: phoneNumberIds[i] };
-    if (CONFIG.LOOKBACK_DATE) {
-      params['createdAfter'] = CONFIG.LOOKBACK_DATE;
+  for (var p = 0; p < phoneNumberIds.length; p++) {
+    for (var b = 0; b < contactPhones.length; b += CONFIG.PARTICIPANTS_BATCH_SIZE) {
+      var batch = contactPhones.slice(b, b + CONFIG.PARTICIPANTS_BATCH_SIZE);
+      var params = {
+        phoneNumberId: phoneNumberIds[p],
+        participants: batch
+      };
+      if (CONFIG.LOOKBACK_DATE) params['createdAfter'] = CONFIG.LOOKBACK_DATE;
+
+      var calls = fetchAllPages('/calls', params, CONFIG.CALLS_PAGE_SIZE);
+      allCalls = allCalls.concat(calls);
     }
-    var calls = fetchAllPages('/calls', params, CONFIG.CALLS_PAGE_SIZE);
-    allCalls = allCalls.concat(calls);
   }
 
   return allCalls;
 }
 
 /**
- * Fetches text message activity for a specific contact phone number.
- * Queries each phoneNumberId. Returns { lastInbound: ISO|'', lastOutbound: ISO|'' }.
- *
- * NOTE: The messages endpoint requires both phoneNumberId and participants[].
- * We pass the contact's E.164 phone as the participant.
+ * Same batching strategy as calls. /messages also requires both
+ * phoneNumberId and participants.
  */
-function fetchTextActivityForContact(normalizedPhone, phoneNumberIds) {
-  var lastInbound = '';
-  var lastOutbound = '';
-  var lastInboundText = '';  // content of most recent inbound text (for language detection)
+function fetchAllMessagesBatched(phoneNumberIds, contactPhones) {
+  var allMessages = [];
+  if (phoneNumberIds.length === 0 || contactPhones.length === 0) return allMessages;
 
-  for (var i = 0; i < phoneNumberIds.length; i++) {
-    var params = {
-      phoneNumberId: phoneNumberIds[i],
-      'participants[]': normalizedPhone
-    };
-    if (CONFIG.LOOKBACK_DATE) {
-      params['createdAfter'] = CONFIG.LOOKBACK_DATE;
+  for (var p = 0; p < phoneNumberIds.length; p++) {
+    for (var b = 0; b < contactPhones.length; b += CONFIG.PARTICIPANTS_BATCH_SIZE) {
+      var batch = contactPhones.slice(b, b + CONFIG.PARTICIPANTS_BATCH_SIZE);
+      var params = {
+        phoneNumberId: phoneNumberIds[p],
+        participants: batch
+      };
+      if (CONFIG.LOOKBACK_DATE) params['createdAfter'] = CONFIG.LOOKBACK_DATE;
+
+      var msgs = fetchAllPages('/messages', params, CONFIG.MESSAGES_PAGE_SIZE);
+      allMessages = allMessages.concat(msgs);
+    }
+  }
+
+  return allMessages;
+}
+
+/**
+ * Indexes messages by the contact's (external) phone number.
+ * Incoming message → index by `from`.
+ * Outgoing message → index by each number in `to`.
+ */
+function indexMessagesByContactPhone(allMessages) {
+  var map = {};
+
+  for (var i = 0; i < allMessages.length; i++) {
+    var msg = allMessages[i];
+    var dir = (msg.direction || '').toLowerCase();
+    var otherPhones = [];
+
+    if (dir === 'incoming' && msg.from) {
+      otherPhones.push(msg.from);
+    } else if (dir === 'outgoing' && msg.to) {
+      otherPhones = Array.isArray(msg.to) ? msg.to : [msg.to];
     }
 
-    // Fetch messages — we only need the most recent of each direction,
-    // but the API doesn't filter by direction, so we fetch a batch and scan.
-    var messages = fetchAllPages('/messages', params, CONFIG.MESSAGES_PAGE_SIZE);
+    for (var p = 0; p < otherPhones.length; p++) {
+      var normalized = normalizePhone(otherPhones[p]);
+      if (!normalized) continue;
+      if (!map[normalized]) map[normalized] = [];
+      map[normalized].push(msg);
+    }
+  }
 
-    for (var m = 0; m < messages.length; m++) {
-      var msg = messages[m];
-      var ts = msg.createdAt || '';
-      // ── FIELD MAPPING: direction is "incoming" or "outgoing" ──
-      var dir = (msg.direction || '').toLowerCase();
+  return map;
+}
 
-      if (dir === 'incoming' && ts > lastInbound) {
-        lastInbound = ts;
-        // ── FIELD MAPPING: message body field is `text` on the Quo API ──
-        lastInboundText = msg.text || '';
-      } else if (dir === 'outgoing' && ts > lastOutbound) {
-        lastOutbound = ts;
-      }
+/**
+ * Scans a contact's messages to find the most recent inbound/outbound timestamps
+ * plus the content of the most recent inbound text (for language detection).
+ */
+function computeTextActivityFromMessages(messages) {
+  var lastInbound = '';
+  var lastOutbound = '';
+  var lastInboundText = '';
+
+  for (var m = 0; m < messages.length; m++) {
+    var msg = messages[m];
+    var ts = msg.createdAt || '';
+    // ── FIELD MAPPING: direction is "incoming" or "outgoing" ──
+    var dir = (msg.direction || '').toLowerCase();
+
+    if (dir === 'incoming' && ts > lastInbound) {
+      lastInbound = ts;
+      // ── FIELD MAPPING: message body field is `text` ──
+      lastInboundText = msg.text || '';
+    } else if (dir === 'outgoing' && ts > lastOutbound) {
+      lastOutbound = ts;
     }
   }
 
@@ -473,28 +532,24 @@ function fetchTextActivityForContact(normalizedPhone, phoneNumberIds) {
 }
 
 /**
- * Fetches voicemail details for calls that may have voicemails.
- * We check missed calls and completed calls where duration is very short.
- * Returns a cache: { callId: { transcript, createdAt, direction } }
+ * Fetches voicemail details for missed calls.
+ * Voicemails most commonly arrive on missed calls; limiting to those keeps
+ * the request count manageable on large datasets.
+ * Returns a cache: { callId: { transcript, duration, direction, createdAt } }
  */
 function fetchVoicemailsForCalls(allCalls) {
   var cache = {};
 
   for (var i = 0; i < allCalls.length; i++) {
     var call = allCalls[i];
-    // ── FIELD MAPPING: status "missed" may have a voicemail ──
-    // Also check completed calls — some voicemails come through as completed.
     var status = (call.status || '').toLowerCase();
-
-    // Only check missed calls or very short completed calls for voicemails
-    if (status !== 'missed' && status !== 'completed') continue;
+    if (status !== 'missed') continue;
 
     var vmResult = quoApiFetch('/call-voicemails/' + call.id, {});
     if (vmResult && vmResult.data && vmResult.data.transcript) {
       cache[call.id] = {
         transcript: vmResult.data.transcript || '',
         duration: vmResult.data.duration || 0,
-        // Voicemail inherits direction/timestamp from the call
         direction: call.direction,
         createdAt: call.createdAt
       };
@@ -823,22 +878,48 @@ function getPrimaryEmail(emails) {
  * otherwise falls back to a lightweight keyword-based heuristic.
  * Returns 'English', 'Spanish', or '' if unclear.
  */
+// Module-level state for language detection.
+// Cache: same text → same result, so we don't re-detect duplicates.
+// Disabled flag: once Google Translate returns 429, skip it for the rest of
+// the run so we don't waste time on endless rate-limit hits.
+var _langCache = {};
+var _googleTranslateDisabled = false;
+
 /**
  * Detects the language of a text sample. Returns 'English', 'Spanish', or ''.
- * Uses the free Google Translate auto-detect endpoint (no API key needed),
- * falls back to a keyword heuristic if the request fails.
+ * Strategy: run the local keyword heuristic first (fast, no network). Only
+ * fall back to the free Google Translate endpoint for ambiguous cases, and
+ * disable Google entirely once it starts rate-limiting.
  */
 function detectLanguage(text) {
   if (!text || typeof text !== 'string') return '';
   var trimmed = text.trim();
   if (trimmed.length < 2) return '';
 
-  // Try the free Google Translate endpoint first
-  var googleResult = detectLanguageViaGoogleTranslate(trimmed);
-  if (googleResult !== null) return googleResult;
+  if (_langCache[trimmed] !== undefined) return _langCache[trimmed];
 
-  // Fallback: keyword heuristic
-  return detectLanguageHeuristic(trimmed);
+  // 1. Local heuristic first — good enough for most messages, zero network
+  var result = detectLanguageHeuristic(trimmed);
+  if (result) {
+    _langCache[trimmed] = result;
+    return result;
+  }
+
+  // 2. Fall back to Google only if it hasn't been disabled
+  if (!_googleTranslateDisabled) {
+    var googleResult = detectLanguageViaGoogleTranslate(trimmed);
+    if (googleResult === null) {
+      // Network error or 429 — disable for rest of run
+      _googleTranslateDisabled = true;
+      Logger.log('Google Translate disabled for this run (rate-limited or error)');
+    } else {
+      _langCache[trimmed] = googleResult;
+      return googleResult;
+    }
+  }
+
+  _langCache[trimmed] = '';
+  return '';
 }
 
 /**
