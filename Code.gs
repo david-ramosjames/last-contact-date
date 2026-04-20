@@ -305,7 +305,8 @@ function quoApiFetch(endpoint, queryParams) {
   var options = {
     method: 'get',
     headers: {
-      'Authorization': 'Bearer ' + CONFIG.API_KEY
+      // Quo / OpenPhone expects the API key directly — NO "Bearer " prefix
+      'Authorization': CONFIG.API_KEY
     },
     muteHttpExceptions: true
   };
