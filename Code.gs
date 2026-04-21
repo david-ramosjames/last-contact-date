@@ -32,8 +32,8 @@ var CONFIG = {
   // Chunked execution — the Apps Script 6-minute limit makes it hard to
   // process thousands of contacts in one go, so we process a chunk per run
   // and schedule a continuation trigger to pick up where we left off.
-  CHUNK_SIZE: 150,              // active contacts processed per run
-  CHUNK_DELAY_SECONDS: 60,      // wait between chunks
+  CHUNK_SIZE: 20,               // active contacts processed per run
+  CHUNK_DELAY_SECONDS: 90,      // wait between chunks
   MAX_RUNTIME_MS: 4 * 60 * 1000, // stop processing after ~4 minutes, safely under the 6-min hard limit
 
   // How far back to look for calls/messages (ISO 8601). Set to null for all time.
