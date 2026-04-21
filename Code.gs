@@ -25,11 +25,6 @@ var CONFIG = {
   CALLS_PAGE_SIZE: 100,     // API max for calls is 100
   MESSAGES_PAGE_SIZE: 50,   // conservative default for messages
 
-  // How many contact phone numbers to include per /calls or /messages request.
-  // Both endpoints require `participants` as an array; batching keeps total
-  // request count low while staying under URL length limits.
-  PARTICIPANTS_BATCH_SIZE: 20,
-
   // Retry / rate-limit settings
   MAX_RETRIES: 4,
   INITIAL_BACKOFF_MS: 1000,
@@ -120,35 +115,63 @@ function syncQuoContactsToSheet() {
   var contacts = fetchAllContacts();
   Logger.log('Total contacts fetched: ' + contacts.length);
 
-  // 5. Pre-extract normalized phone numbers for all contacts.
-  //    Both /calls and /messages require `participants`, so we need the full
-  //    list upfront to batch requests.
-  var allContactPhones = [];
-  for (var c = 0; c < contacts.length; c++) {
-    var phone = getPrimaryPhone((contacts[c].defaultFields || {}).phoneNumbers);
-    var np = normalizePhone(phone);
-    if (np) allContactPhones.push(np);
+  // 5. Use /conversations to discover which contacts have activity and
+  //    on which phoneNumberId. This avoids brute-forcing calls/messages
+  //    for all 5 phone numbers × all contacts (the API only accepts 1
+  //    participant per request).
+  var conversationMap = buildConversationMap(phoneNumberIds);
+  Logger.log('Active conversations mapped: ' + Object.keys(conversationMap).length);
+
+  // 6. For contacts with known conversations, fetch calls and messages.
+  //    Each request goes to the specific phoneNumberId(s) the contact uses.
+  var callsByPhone = {};
+  var messagesByPhone = {};
+  var fetchedCount = 0;
+
+  var allContactPhones = Object.keys(conversationMap);
+  for (var f = 0; f < allContactPhones.length; f++) {
+    var phone = allContactPhones[f];
+    var pnIds = conversationMap[phone]; // array of phoneNumberIds this contact talks on
+
+    for (var pn = 0; pn < pnIds.length; pn++) {
+      // Fetch calls for this participant + phoneNumberId pair
+      var calls = fetchAllPages('/calls', {
+        phoneNumberId: pnIds[pn],
+        participants: [phone]
+      }, CONFIG.CALLS_PAGE_SIZE);
+
+      if (calls.length > 0) {
+        if (!callsByPhone[phone]) callsByPhone[phone] = [];
+        callsByPhone[phone] = callsByPhone[phone].concat(calls);
+      }
+
+      // Fetch messages for this participant + phoneNumberId pair
+      var msgs = fetchAllPages('/messages', {
+        phoneNumberId: pnIds[pn],
+        participants: [phone]
+      }, CONFIG.MESSAGES_PAGE_SIZE);
+
+      if (msgs.length > 0) {
+        if (!messagesByPhone[phone]) messagesByPhone[phone] = [];
+        messagesByPhone[phone] = messagesByPhone[phone].concat(msgs);
+      }
+    }
+
+    fetchedCount++;
+    if (fetchedCount % 100 === 0) {
+      Logger.log('Fetched activity for ' + fetchedCount + '/' + allContactPhones.length + ' active contacts');
+    }
   }
-  // Deduplicate
-  allContactPhones = Array.from(new Set(allContactPhones));
-  Logger.log('Unique contact phone numbers: ' + allContactPhones.length);
 
-  // 6. Fetch all calls and messages in batched requests
-  var allCalls = fetchAllCallsBatched(phoneNumberIds, allContactPhones);
-  Logger.log('Total calls fetched: ' + allCalls.length);
+  Logger.log('Total calls fetched: ' + countValues(callsByPhone));
+  Logger.log('Total messages fetched: ' + countValues(messagesByPhone));
 
-  var allMessages = fetchAllMessagesBatched(phoneNumberIds, allContactPhones);
-  Logger.log('Total messages fetched: ' + allMessages.length);
-
-  // 7. Build lookup maps keyed by participant phone
-  var callsByPhone = indexCallsByParticipant(allCalls);
-  var messagesByPhone = indexMessagesByContactPhone(allMessages);
-
-  // 8. Fetch voicemails for missed calls (those are the ones likely to have one)
+  // 7. Fetch voicemails for missed calls
+  var allCalls = flattenMap(callsByPhone);
   var voicemailCache = fetchVoicemailsForCalls(allCalls);
   Logger.log('Voicemails fetched: ' + Object.keys(voicemailCache).length);
 
-  // 9. Process each contact: build/update their row
+  // 8. Process each contact: build/update their row
   var rowsToWrite = [];
   var contactIdOrder = [];
 
@@ -157,7 +180,6 @@ function syncQuoContactsToSheet() {
     var contactId = contact.id || '';
     if (!contactId) continue;
 
-    // Extract contact fields
     // ── FIELD MAPPING: Adjust these if Quo API field names differ ──
     var df = contact.defaultFields || {};
     var firstName = df.firstName || '';
@@ -169,7 +191,6 @@ function syncQuoContactsToSheet() {
 
     var normalizedPhone = normalizePhone(primaryPhone);
 
-    // Look up pre-fetched activity for this contact
     var contactCalls = normalizedPhone ? (callsByPhone[normalizedPhone] || []) : [];
     var contactMessages = normalizedPhone ? (messagesByPhone[normalizedPhone] || []) : [];
 
@@ -420,80 +441,35 @@ function fetchAllContacts() {
 }
 
 /**
- * Fetches all calls for every combination of (phoneNumberId × participants batch).
- * The /calls endpoint requires both `phoneNumberId` and `participants` (array),
- * so we chunk the contact phone list into batches to keep request count low.
+ * Fetches all conversations and builds a map of contactPhone → [phoneNumberId, ...]
+ * This tells us exactly which contacts have activity and which of our phone numbers
+ * they communicate on, so we only make targeted calls/messages requests instead
+ * of brute-forcing all combinations.
+ *
+ * The /conversations endpoint does NOT require a participants filter.
  */
-function fetchAllCallsBatched(phoneNumberIds, contactPhones) {
-  var allCalls = [];
-  if (phoneNumberIds.length === 0 || contactPhones.length === 0) return allCalls;
+function buildConversationMap(phoneNumberIds) {
+  var map = {}; // normalizedPhone → [phoneNumberId, ...]
 
   for (var p = 0; p < phoneNumberIds.length; p++) {
-    for (var b = 0; b < contactPhones.length; b += CONFIG.PARTICIPANTS_BATCH_SIZE) {
-      var batch = contactPhones.slice(b, b + CONFIG.PARTICIPANTS_BATCH_SIZE);
-      var params = {
-        phoneNumberId: phoneNumberIds[p],
-        participants: batch
-      };
-      if (CONFIG.LOOKBACK_DATE) params['createdAfter'] = CONFIG.LOOKBACK_DATE;
+    var conversations = fetchAllPages('/conversations', {
+      phoneNumbers: [phoneNumberIds[p]]
+    }, 50);
 
-      var calls = fetchAllPages('/calls', params, CONFIG.CALLS_PAGE_SIZE);
-      allCalls = allCalls.concat(calls);
-    }
-  }
+    for (var c = 0; c < conversations.length; c++) {
+      var conv = conversations[c];
+      var participants = conv.participants || [];
+      var pnId = conv.phoneNumberId || phoneNumberIds[p];
 
-  return allCalls;
-}
-
-/**
- * Same batching strategy as calls. /messages also requires both
- * phoneNumberId and participants.
- */
-function fetchAllMessagesBatched(phoneNumberIds, contactPhones) {
-  var allMessages = [];
-  if (phoneNumberIds.length === 0 || contactPhones.length === 0) return allMessages;
-
-  for (var p = 0; p < phoneNumberIds.length; p++) {
-    for (var b = 0; b < contactPhones.length; b += CONFIG.PARTICIPANTS_BATCH_SIZE) {
-      var batch = contactPhones.slice(b, b + CONFIG.PARTICIPANTS_BATCH_SIZE);
-      var params = {
-        phoneNumberId: phoneNumberIds[p],
-        participants: batch
-      };
-      if (CONFIG.LOOKBACK_DATE) params['createdAfter'] = CONFIG.LOOKBACK_DATE;
-
-      var msgs = fetchAllPages('/messages', params, CONFIG.MESSAGES_PAGE_SIZE);
-      allMessages = allMessages.concat(msgs);
-    }
-  }
-
-  return allMessages;
-}
-
-/**
- * Indexes messages by the contact's (external) phone number.
- * Incoming message → index by `from`.
- * Outgoing message → index by each number in `to`.
- */
-function indexMessagesByContactPhone(allMessages) {
-  var map = {};
-
-  for (var i = 0; i < allMessages.length; i++) {
-    var msg = allMessages[i];
-    var dir = (msg.direction || '').toLowerCase();
-    var otherPhones = [];
-
-    if (dir === 'incoming' && msg.from) {
-      otherPhones.push(msg.from);
-    } else if (dir === 'outgoing' && msg.to) {
-      otherPhones = Array.isArray(msg.to) ? msg.to : [msg.to];
-    }
-
-    for (var p = 0; p < otherPhones.length; p++) {
-      var normalized = normalizePhone(otherPhones[p]);
-      if (!normalized) continue;
-      if (!map[normalized]) map[normalized] = [];
-      map[normalized].push(msg);
+      for (var x = 0; x < participants.length; x++) {
+        var normalized = normalizePhone(participants[x]);
+        if (!normalized) continue;
+        if (!map[normalized]) map[normalized] = [];
+        // Avoid duplicate phoneNumberId entries for the same contact
+        if (map[normalized].indexOf(pnId) === -1) {
+          map[normalized].push(pnId);
+        }
+      }
     }
   }
 
@@ -565,25 +541,25 @@ function fetchVoicemailsForCalls(allCalls) {
 // =============================================================================
 
 /**
- * Indexes calls by participant phone number for fast lookup.
- * Returns { normalizedPhone: [call, call, ...] }
+ * Counts total items across all arrays in a map.
  */
-function indexCallsByParticipant(allCalls) {
-  var map = {};
-
-  for (var i = 0; i < allCalls.length; i++) {
-    var call = allCalls[i];
-    var participants = call.participants || [];
-
-    for (var p = 0; p < participants.length; p++) {
-      var phone = normalizePhone(participants[p]);
-      if (!phone) continue;
-      if (!map[phone]) map[phone] = [];
-      map[phone].push(call);
-    }
+function countValues(map) {
+  var total = 0;
+  for (var key in map) {
+    total += map[key].length;
   }
+  return total;
+}
 
-  return map;
+/**
+ * Flattens a { key: [items] } map into a single array of all items.
+ */
+function flattenMap(map) {
+  var all = [];
+  for (var key in map) {
+    all = all.concat(map[key]);
+  }
+  return all;
 }
 
 /**
