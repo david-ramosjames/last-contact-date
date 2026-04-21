@@ -29,10 +29,22 @@ var CONFIG = {
   MAX_RETRIES: 4,
   INITIAL_BACKOFF_MS: 1000,
 
+  // Chunked execution — the Apps Script 6-minute limit makes it hard to
+  // process thousands of contacts in one go, so we process a chunk per run
+  // and schedule a continuation trigger to pick up where we left off.
+  CHUNK_SIZE: 150,              // active contacts processed per run
+  CHUNK_DELAY_SECONDS: 60,      // wait between chunks
+  MAX_RUNTIME_MS: 4 * 60 * 1000, // stop processing after ~4 minutes, safely under the 6-min hard limit
+
   // How far back to look for calls/messages (ISO 8601). Set to null for all time.
   // Example: '2024-01-01T00:00:00Z'
   LOOKBACK_DATE: null
 };
+
+// Script Properties keys used for resumable chunked sync
+var PROP_SYNC_OFFSET = 'QUO_SYNC_OFFSET';
+var PROP_SYNC_STARTED_AT = 'QUO_SYNC_STARTED_AT';
+var CONTINUATION_TRIGGER_FN = 'quoSyncContinue_';
 
 // ─── COLUMN HEADERS (exact order as specified) ───────────────────────────────
 
@@ -80,8 +92,21 @@ function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('Quo Sync')
     .addItem('Sync Contacts Now', 'syncQuoContactsToSheet')
+    .addItem('Cancel In-Progress Sync', 'cancelQuoSync')
     .addItem('Setup Sheet', 'setupSheet')
     .addToUi();
+}
+
+/**
+ * Cancels a chunked sync that's in progress — clears progress state and
+ * removes the continuation trigger.
+ */
+function cancelQuoSync() {
+  var props = PropertiesService.getScriptProperties();
+  props.deleteProperty(PROP_SYNC_OFFSET);
+  props.deleteProperty(PROP_SYNC_STARTED_AT);
+  clearContinuationTriggers_();
+  Logger.log('In-progress sync cancelled.');
 }
 
 
@@ -92,124 +117,224 @@ function onOpen() {
 /**
  * Main sync function. Call this manually or via a time-driven trigger.
  */
+/**
+ * Main entry point. Starts a fresh sync run (resets any in-progress state).
+ */
 function syncQuoContactsToSheet() {
-  var startTime = new Date();
-  Logger.log('=== Quo Sync started at ' + startTime.toISOString() + ' ===');
+  var props = PropertiesService.getScriptProperties();
+  props.deleteProperty(PROP_SYNC_OFFSET);
+  props.setProperty(PROP_SYNC_STARTED_AT, new Date().toISOString());
+  clearContinuationTriggers_();
+  runSyncChunk_();
+}
 
-  // 1. Ensure sheet and headers exist
+/**
+ * Continuation callback fired by the time-based trigger we schedule
+ * between chunks. Resumes from the saved offset.
+ */
+function quoSyncContinue_() {
+  runSyncChunk_();
+}
+
+/**
+ * Processes one chunk of contacts, then either schedules the next chunk
+ * or wraps up the sync.
+ */
+function runSyncChunk_() {
+  var runStart = new Date();
+  var props = PropertiesService.getScriptProperties();
+  var offset = parseInt(props.getProperty(PROP_SYNC_OFFSET) || '0', 10);
+  var syncStartedAt = props.getProperty(PROP_SYNC_STARTED_AT) || runStart.toISOString();
+  var isFirstChunk = (offset === 0);
+
+  Logger.log('=== Quo Sync chunk starting (offset=' + offset + ') ===');
+
   var sheet = setupSheet();
-
-  // 2. Read existing rows into a map keyed by Contact ID
-  var existingMap = readExistingRows(sheet);
-  Logger.log('Existing contacts in sheet: ' + Object.keys(existingMap).length);
-
-  // 3. Fetch all phone number IDs (needed for calls/messages endpoints)
   var phoneNumberIds = fetchAllPhoneNumberIds();
-  Logger.log('Quo phone numbers found: ' + phoneNumberIds.length);
+  Logger.log('Quo phone numbers: ' + phoneNumberIds.length);
 
-  if (phoneNumberIds.length === 0) {
-    Logger.log('WARNING: No phone numbers found. Calls/messages will not be fetched.');
-  }
-
-  // 4. Fetch ALL contacts from Quo
   var contacts = fetchAllContacts();
   Logger.log('Total contacts fetched: ' + contacts.length);
 
-  // 5. Use /conversations to discover which contacts have activity and
-  //    on which phoneNumberId. This avoids brute-forcing calls/messages
-  //    for all 5 phone numbers × all contacts (the API only accepts 1
-  //    participant per request).
-  var conversationMap = buildConversationMap(phoneNumberIds);
-  Logger.log('Active conversations mapped: ' + Object.keys(conversationMap).length);
+  // Write basic rows for all contacts on the first chunk so the sheet is
+  // populated immediately — activity columns will be filled chunk by chunk.
+  if (isFirstChunk) {
+    writeBasicContactRows_(sheet, contacts, syncStartedAt);
+  }
 
-  // 6. For contacts with known conversations, fetch calls and messages.
-  //    Each request goes to the specific phoneNumberId(s) the contact uses.
-  var callsByPhone = {};
-  var messagesByPhone = {};
-  var fetchedCount = 0;
-
-  var allContactPhones = Object.keys(conversationMap);
-  for (var f = 0; f < allContactPhones.length; f++) {
-    var phone = allContactPhones[f];
-    var pnIds = conversationMap[phone]; // array of phoneNumberIds this contact talks on
-
-    for (var pn = 0; pn < pnIds.length; pn++) {
-      // Fetch calls for this participant + phoneNumberId pair
-      var calls = fetchAllPages('/calls', {
-        phoneNumberId: pnIds[pn],
-        participants: [phone]
-      }, CONFIG.CALLS_PAGE_SIZE);
-
-      if (calls.length > 0) {
-        if (!callsByPhone[phone]) callsByPhone[phone] = [];
-        callsByPhone[phone] = callsByPhone[phone].concat(calls);
-      }
-
-      // Fetch messages for this participant + phoneNumberId pair
-      var msgs = fetchAllPages('/messages', {
-        phoneNumberId: pnIds[pn],
-        participants: [phone]
-      }, CONFIG.MESSAGES_PAGE_SIZE);
-
-      if (msgs.length > 0) {
-        if (!messagesByPhone[phone]) messagesByPhone[phone] = [];
-        messagesByPhone[phone] = messagesByPhone[phone].concat(msgs);
-      }
-    }
-
-    fetchedCount++;
-    if (fetchedCount % 100 === 0) {
-      Logger.log('Fetched activity for ' + fetchedCount + '/' + allContactPhones.length + ' active contacts');
+  // Build a set of normalized contact phones — we filter the conversation
+  // map to these so we only fetch activity for contacts we care about.
+  var contactPhoneSet = {};
+  var contactsByPhone = {};
+  for (var c = 0; c < contacts.length; c++) {
+    var phone = normalizePhone(getPrimaryPhone((contacts[c].defaultFields || {}).phoneNumbers));
+    if (phone) {
+      contactPhoneSet[phone] = true;
+      contactsByPhone[phone] = contacts[c];
     }
   }
 
-  Logger.log('Total calls fetched: ' + countValues(callsByPhone));
-  Logger.log('Total messages fetched: ' + countValues(messagesByPhone));
+  // Build conversation map filtered to contacts only
+  var conversationMap = buildConversationMap(phoneNumberIds, contactPhoneSet);
+  Logger.log('Active contact conversations: ' + Object.keys(conversationMap).length);
 
-  // 7. Fetch voicemails for missed calls
-  var allCalls = flattenMap(callsByPhone);
-  var voicemailCache = fetchVoicemailsForCalls(allCalls);
-  Logger.log('Voicemails fetched: ' + Object.keys(voicemailCache).length);
+  // Deterministic ordering so offset is stable across runs
+  var activePhones = Object.keys(conversationMap).sort();
+  var total = activePhones.length;
 
-  // 8. Process each contact: build/update their row
-  var rowsToWrite = [];
-  var contactIdOrder = [];
+  // Read existing rows once for in-place updates
+  var existingMap = readExistingRows(sheet);
+
+  var processed = 0;
+  var cutoff = offset + CONFIG.CHUNK_SIZE;
+
+  for (var i = offset; i < total && i < cutoff; i++) {
+    // Respect the wall-clock safety budget too, in case fetches are slow
+    if (new Date() - runStart > CONFIG.MAX_RUNTIME_MS) {
+      Logger.log('Chunk hit runtime budget at offset ' + i);
+      break;
+    }
+
+    var phone = activePhones[i];
+    var contact = contactsByPhone[phone];
+    if (!contact) { processed++; continue; }
+
+    var pnIds = conversationMap[phone];
+    var calls = [];
+    var messages = [];
+
+    for (var pn = 0; pn < pnIds.length; pn++) {
+      calls = calls.concat(fetchAllPages('/calls', {
+        phoneNumberId: pnIds[pn], participants: [phone]
+      }, CONFIG.CALLS_PAGE_SIZE));
+
+      messages = messages.concat(fetchAllPages('/messages', {
+        phoneNumberId: pnIds[pn], participants: [phone]
+      }, CONFIG.MESSAGES_PAGE_SIZE));
+    }
+
+    var voicemailCache = fetchVoicemailsForCalls(calls);
+    var classified = classifyCalls(calls, voicemailCache);
+    var textActivity = computeTextActivityFromMessages(messages);
+
+    // Build updated row
+    var df = contact.defaultFields || {};
+    var name = ((df.firstName || '') + ' ' + (df.lastName || '')).trim();
+    var row = buildContactRow(
+      contact.id,
+      name,
+      df.company || '',
+      getPrimaryPhone(df.phoneNumbers),
+      getPrimaryEmail(df.emails),
+      classified,
+      textActivity,
+      new Date()
+    );
+
+    // Update in place (row must already exist from the first-chunk basic write)
+    if (existingMap[contact.id]) {
+      sheet.getRange(existingMap[contact.id].rowIndex, 1, 1, HEADERS.length)
+           .setValues([row]);
+    } else {
+      sheet.appendRow(row);
+    }
+
+    processed++;
+  }
+
+  var newOffset = offset + processed;
+  Logger.log('Processed ' + processed + ' contacts this chunk (' + offset + ' → ' + newOffset + ' of ' + total + ')');
+
+  if (newOffset >= total) {
+    // Done
+    props.deleteProperty(PROP_SYNC_OFFSET);
+    props.deleteProperty(PROP_SYNC_STARTED_AT);
+    clearContinuationTriggers_();
+    Logger.log('=== Quo Sync complete ===');
+  } else {
+    props.setProperty(PROP_SYNC_OFFSET, String(newOffset));
+    scheduleContinuation_();
+    Logger.log('Scheduled next chunk in ' + CONFIG.CHUNK_DELAY_SECONDS + 's; offset now ' + newOffset);
+  }
+}
+
+/**
+ * Writes a starter row for every contact with basic fields filled in.
+ * Activity columns are left blank and get populated as each chunk runs.
+ */
+function writeBasicContactRows_(sheet, contacts, syncStartedAt) {
+  var existingMap = readExistingRows(sheet);
+  var rowsToUpdate = [];
+  var rowsToAppend = [];
 
   for (var i = 0; i < contacts.length; i++) {
     var contact = contacts[i];
-    var contactId = contact.id || '';
-    if (!contactId) continue;
+    if (!contact.id) continue;
 
-    // ── FIELD MAPPING: Adjust these if Quo API field names differ ──
     var df = contact.defaultFields || {};
-    var firstName = df.firstName || '';
-    var lastName = df.lastName || '';
-    var name = (firstName + ' ' + lastName).trim();
-    var company = df.company || '';
-    var primaryPhone = getPrimaryPhone(df.phoneNumbers);
+    var name = ((df.firstName || '') + ' ' + (df.lastName || '')).trim();
+    var phone = getPrimaryPhone(df.phoneNumbers);
     var email = getPrimaryEmail(df.emails);
 
-    var normalizedPhone = normalizePhone(primaryPhone);
-
-    var contactCalls = normalizedPhone ? (callsByPhone[normalizedPhone] || []) : [];
-    var contactMessages = normalizedPhone ? (messagesByPhone[normalizedPhone] || []) : [];
-
-    var classified = classifyCalls(contactCalls, voicemailCache);
-    var textActivity = computeTextActivityFromMessages(contactMessages);
-
-    var row = buildContactRow(contactId, name, company, primaryPhone, email,
-                              classified, textActivity, startTime);
-
-    contactIdOrder.push(contactId);
-    rowsToWrite.push(row);
+    if (existingMap[contact.id]) {
+      // Only overwrite the basic identity columns; preserve any existing
+      // activity data from previous syncs until this run's activity fetch
+      // replaces it.
+      var existing = existingMap[contact.id].data.slice();
+      existing[COL['Contact ID']] = contact.id;
+      existing[COL['Name']] = name;
+      existing[COL['Company']] = df.company || '';
+      existing[COL['Primary Phone']] = phone;
+      existing[COL['Email']] = email;
+      existing[COL['Last Sync At']] = syncStartedAt;
+      rowsToUpdate.push({ rowIndex: existingMap[contact.id].rowIndex, data: existing });
+    } else {
+      var row = new Array(HEADERS.length).fill('');
+      row[COL['Contact ID']] = contact.id;
+      row[COL['Name']] = name;
+      row[COL['Company']] = df.company || '';
+      row[COL['Primary Phone']] = phone;
+      row[COL['Email']] = email;
+      row[COL['Last Sync At']] = syncStartedAt;
+      rowsToAppend.push(row);
+    }
   }
 
-  // 9. Write all rows to the sheet (update existing, append new)
-  writeRowsToSheet(sheet, existingMap, contactIdOrder, rowsToWrite);
+  for (var u = 0; u < rowsToUpdate.length; u++) {
+    sheet.getRange(rowsToUpdate[u].rowIndex, 1, 1, HEADERS.length)
+         .setValues([rowsToUpdate[u].data]);
+  }
 
-  var endTime = new Date();
-  var durationSec = ((endTime - startTime) / 1000).toFixed(1);
-  Logger.log('=== Quo Sync completed in ' + durationSec + 's ===');
+  if (rowsToAppend.length > 0) {
+    var startRow = sheet.getLastRow() + 1;
+    sheet.getRange(startRow, 1, rowsToAppend.length, HEADERS.length)
+         .setValues(rowsToAppend);
+  }
+
+  Logger.log('Basic rows written: ' + rowsToUpdate.length + ' updated, ' + rowsToAppend.length + ' appended');
+}
+
+/**
+ * Creates a one-shot time-based trigger to resume the sync after a delay.
+ */
+function scheduleContinuation_() {
+  clearContinuationTriggers_();
+  ScriptApp.newTrigger(CONTINUATION_TRIGGER_FN)
+    .timeBased()
+    .after(CONFIG.CHUNK_DELAY_SECONDS * 1000)
+    .create();
+}
+
+/**
+ * Removes any previously-scheduled continuation triggers.
+ */
+function clearContinuationTriggers_() {
+  var triggers = ScriptApp.getProjectTriggers();
+  for (var t = 0; t < triggers.length; t++) {
+    if (triggers[t].getHandlerFunction() === CONTINUATION_TRIGGER_FN) {
+      ScriptApp.deleteTrigger(triggers[t]);
+    }
+  }
 }
 
 
@@ -266,45 +391,6 @@ function readExistingRows(sheet) {
 
   return map;
 }
-
-/**
- * Writes rows to the sheet. Updates existing rows in place, appends new ones.
- */
-function writeRowsToSheet(sheet, existingMap, contactIdOrder, rowsToWrite) {
-  var rowsToUpdate = [];  // { range, values }
-  var rowsToAppend = [];
-
-  for (var i = 0; i < contactIdOrder.length; i++) {
-    var contactId = contactIdOrder[i];
-    var rowData = rowsToWrite[i];
-
-    if (existingMap[contactId]) {
-      // Update in place
-      var rowIdx = existingMap[contactId].rowIndex;
-      rowsToUpdate.push({ rowIndex: rowIdx, data: rowData });
-    } else {
-      // Append
-      rowsToAppend.push(rowData);
-    }
-  }
-
-  // Batch update existing rows
-  for (var u = 0; u < rowsToUpdate.length; u++) {
-    sheet.getRange(rowsToUpdate[u].rowIndex, 1, 1, HEADERS.length)
-         .setValues([rowsToUpdate[u].data]);
-  }
-
-  // Batch append new rows
-  if (rowsToAppend.length > 0) {
-    var startRow = sheet.getLastRow() + 1;
-    sheet.getRange(startRow, 1, rowsToAppend.length, HEADERS.length)
-         .setValues(rowsToAppend);
-    Logger.log('Appended ' + rowsToAppend.length + ' new contact rows.');
-  }
-
-  Logger.log('Updated ' + rowsToUpdate.length + ' existing contact rows.');
-}
-
 
 // =============================================================================
 // API FETCH HELPERS
@@ -442,14 +528,13 @@ function fetchAllContacts() {
 
 /**
  * Fetches all conversations and builds a map of contactPhone → [phoneNumberId, ...]
- * This tells us exactly which contacts have activity and which of our phone numbers
- * they communicate on, so we only make targeted calls/messages requests instead
- * of brute-forcing all combinations.
+ * Filtered to only include phones that match a known contact, so we don't
+ * waste time fetching activity for people who aren't in the contacts list.
  *
  * The /conversations endpoint does NOT require a participants filter.
  */
-function buildConversationMap(phoneNumberIds) {
-  var map = {}; // normalizedPhone → [phoneNumberId, ...]
+function buildConversationMap(phoneNumberIds, contactPhoneSet) {
+  var map = {};
 
   for (var p = 0; p < phoneNumberIds.length; p++) {
     var conversations = fetchAllPages('/conversations', {
@@ -464,8 +549,10 @@ function buildConversationMap(phoneNumberIds) {
       for (var x = 0; x < participants.length; x++) {
         var normalized = normalizePhone(participants[x]);
         if (!normalized) continue;
+        // Skip phones that don't belong to a known contact
+        if (contactPhoneSet && !contactPhoneSet[normalized]) continue;
+
         if (!map[normalized]) map[normalized] = [];
-        // Avoid duplicate phoneNumberId entries for the same contact
         if (map[normalized].indexOf(pnId) === -1) {
           map[normalized].push(pnId);
         }
@@ -539,28 +626,6 @@ function fetchVoicemailsForCalls(allCalls) {
 // =============================================================================
 // CALL CLASSIFICATION
 // =============================================================================
-
-/**
- * Counts total items across all arrays in a map.
- */
-function countValues(map) {
-  var total = 0;
-  for (var key in map) {
-    total += map[key].length;
-  }
-  return total;
-}
-
-/**
- * Flattens a { key: [items] } map into a single array of all items.
- */
-function flattenMap(map) {
-  var all = [];
-  for (var key in map) {
-    all = all.concat(map[key]);
-  }
-  return all;
-}
 
 /**
  * Classifies an array of calls into categories.
