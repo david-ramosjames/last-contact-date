@@ -1,106 +1,101 @@
 // =============================================================================
-// QUO CONTACTS SHEET SYNC — Google Apps Script
+// QUO CONTACTS SHEET SYNC - Google Apps Script
 // =============================================================================
-// Syncs all Quo (formerly OpenPhone) contacts and their communication activity
-// into a single Google Sheet. One row per contact, updated in place.
-//
-// API base: https://api.openphone.com/v1
-// Auth: Bearer token via API key
+// Faster version:
+// - Uses /conversations as the fast activity index.
+// - Only fetches expensive /calls and /messages when a contact is new or changed.
+// - Adds a menu function to sync one contact by phone and write it to the sheet.
 // =============================================================================
-
-// ─── CONFIGURATION ───────────────────────────────────────────────────────────
 
 var CONFIG = {
-  // Quo / OpenPhone API key — set this in Script Properties instead of hardcoding.
-  // Go to Project Settings → Script Properties → Add: QUO_API_KEY = your key
   API_KEY: PropertiesService.getScriptProperties().getProperty('QUO_API_KEY') || 'YOUR_API_KEY_HERE',
-
   API_BASE: 'https://api.openphone.com/v1',
 
-  // Name of the sheet tab to use (created automatically if missing)
   SHEET_NAME: 'Quo Contacts',
+  CONVERSATION_CACHE_SHEET_NAME: 'Quo Sync Cache',
 
-  // Pagination page sizes (max allowed by API)
-  CONTACTS_PAGE_SIZE: 50,   // API max for contacts is 50
-  CALLS_PAGE_SIZE: 100,     // API max for calls is 100
-  MESSAGES_PAGE_SIZE: 50,   // conservative default for messages
+  CONTACTS_PAGE_SIZE: 50,
+  CALLS_PAGE_SIZE: 100,
+  MESSAGES_PAGE_SIZE: 100,
+  USERS_PAGE_SIZE: 50,
+  CONVERSATIONS_PAGE_SIZE: 50,
 
-  // Retry / rate-limit settings
   MAX_RETRIES: 4,
   INITIAL_BACKOFF_MS: 1000,
 
-  // Chunked execution — the Apps Script 6-minute limit makes it hard to
-  // process thousands of contacts in one go, so we process a chunk per run
-  // and schedule a continuation trigger to pick up where we left off.
-  CHUNK_SIZE: 20,               // active contacts processed per run
-  CHUNK_DELAY_SECONDS: 90,      // wait between chunks
-  MAX_RUNTIME_MS: 4 * 60 * 1000, // stop processing after ~4 minutes, safely under the 6-min hard limit
+  CHUNK_SIZE: 40,
+  CHUNK_DELAY_SECONDS: 30,
+  MAX_RUNTIME_MS: 4 * 60 * 1000,
 
-  // How far back to look for calls/messages (ISO 8601). Set to null for all time.
-  // Example: '2024-01-01T00:00:00Z'
-  LOOKBACK_DATE: null
+  // Language detection reads only what the CONTACT said or wrote: inbound
+  // texts, inbound voicemail transcripts, and the contact's own lines from
+  // call transcripts. Quo call summaries are never used - they are AI-written
+  // and always in English, so they would mark every Spanish speaker English.
+  MIN_LANGUAGE_SAMPLE_WORDS: 8,
+  MAX_LANGUAGE_SAMPLES: 5,
+  MAX_TRANSCRIPT_LOOKUPS: 3
 };
 
-// Script Properties keys used for resumable chunked sync
 var PROP_SYNC_OFFSET = 'QUO_SYNC_OFFSET';
 var PROP_SYNC_STARTED_AT = 'QUO_SYNC_STARTED_AT';
 var CONTINUATION_TRIGGER_FN = 'quoSyncContinue_';
 
-// ─── COLUMN HEADERS (exact order as specified) ───────────────────────────────
-
 var HEADERS = [
-  'Contact ID',                     // A  (1)
-  'Name',                           // B  (2)
-  'Company',                        // C  (3)
-  'Primary Phone',                  // D  (4)
-  'Email',                          // E  (5)
-  'Last Completed Inbound Call At', // F  (6)
-  'Last Completed Outbound Call At',// G  (7)
-  'Last Completed Human Call At',   // H  (8)
-  'Last Inbound Text At',          // I  (9)
-  'Last Outbound Text At',         // J  (10)
-  'Last Text At',                  // K  (11)
-  'Last Missed Call At',           // L  (12)
-  'Last Missed Inbound Call At',   // M  (13)
-  'Last Missed Outbound Call At',  // N  (14)
-  'Last Sona Call At',             // O  (15)
-  'Last Sona Inbound Call At',     // P  (16)
-  'Last Sona Outbound Call At',    // Q  (17)
-  'Last Voicemail At',             // R  (18)
-  'Last Inbound Voicemail At',     // S  (19)
-  'Last Outbound Voicemail At',    // T  (20)
-  'Last Language Used',            // U  (21)
-  'Last Outbound Call At',         // V  (22)
-  'Last Any Call At',              // W  (23)
-  'Last Any Contact At',           // X  (24)
-  'Last Contact Type',             // Y  (25)
-  'Last Contact Direction',        // Z  (26)
-  'Days Since Last Contact',       // AA (27)
-  'Last Sync At'                   // AB (28)
+  'Contact ID',
+  'Name',
+  'Company',
+  'Primary Phone',
+  'Email',
+  'Last Completed Inbound Call At',
+  'Last Completed Outbound Call At',
+  'Last Completed Human Call At',
+  'Last Inbound Text At',
+  'Last Outbound Text At',
+  'Last Text At',
+  'Last Missed Call At',
+  'Last Missed Inbound Call At',
+  'Last Missed Outbound Call At',
+  'Last Sona Call At',
+  'Last Sona Inbound Call At',
+  'Last Sona Outbound Call At',
+  'Last Voicemail At',
+  'Last Inbound Voicemail At',
+  'Last Outbound Voicemail At',
+  'Last Language Used',
+  'Last Outbound Call At',
+  'Last Any Call At',
+  'Last Any Contact At',
+  'Last Contact Type',
+  'Last Contact Direction',
+  'Last Conversation Activity At',
+  'Days Since Last Contact',
+  'Last Sync At'
 ];
 
-// Column index lookup (0-based)
 var COL = {};
-HEADERS.forEach(function(h, i) { COL[h] = i; });
-
+HEADERS.forEach(function(h, i) {
+  COL[h] = i;
+});
 
 // =============================================================================
-// CUSTOM MENU
+// MENU
 // =============================================================================
 
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('Quo Sync')
     .addItem('Sync Contacts Now', 'syncQuoContactsToSheet')
+    .addItem('Sync One Contact By Phone', 'syncOneContactByPhonePrompt')
+    .addItem('Force Full Resync (Refetch Everything)', 'forceFullResyncPrompt')
     .addItem('Cancel In-Progress Sync', 'cancelQuoSync')
+    .addSeparator()
+    .addItem('Debug Contact Activity By Phone', 'debugContactActivityPrompt')
+    .addItem('Debug Contact Record By Phone', 'debugContactRecordPrompt')
+    .addItem('Debug Language Sample By Phone', 'debugLanguageSamplePrompt')
     .addItem('Setup Sheet', 'setupSheet')
     .addToUi();
 }
 
-/**
- * Cancels a chunked sync that's in progress — clears progress state and
- * removes the continuation trigger.
- */
 function cancelQuoSync() {
   var props = PropertiesService.getScriptProperties();
   props.deleteProperty(PROP_SYNC_OFFSET);
@@ -109,17 +104,53 @@ function cancelQuoSync() {
   Logger.log('In-progress sync cancelled.');
 }
 
+/**
+ * Clears the change-detection state so the next sync refetches activity for
+ * every contact instead of skipping unchanged ones. Needed after a change to
+ * how a column is derived - otherwise contacts whose conversations have not
+ * moved keep their old values indefinitely.
+ */
+function forceFullResyncPrompt() {
+  var ui = SpreadsheetApp.getUi();
+  var sheet = setupSheet();
+  var lastRow = sheet.getLastRow();
+  var rowCount = Math.max(0, lastRow - 1);
+
+  var response = ui.alert(
+    'Force Full Resync',
+    'This clears the cached activity timestamps for ' + rowCount + ' contacts so the next ' +
+    'sync refetches all of them from scratch. Existing data stays in place until it is ' +
+    'replaced. This makes the next sync much slower. Continue?',
+    ui.ButtonSet.OK_CANCEL
+  );
+
+  if (response !== ui.Button.OK) return;
+
+  clearChangeDetectionState_(sheet);
+  ui.alert('Cleared. Run "Sync Contacts Now" to refetch every contact.');
+}
+
+function clearChangeDetectionState_(sheet) {
+  var lastRow = sheet.getLastRow();
+
+  if (lastRow >= 2) {
+    sheet.getRange(2, COL['Last Conversation Activity At'] + 1, lastRow - 1, 1).clearContent();
+  }
+
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var cacheSheet = ss.getSheetByName(CONFIG.CONVERSATION_CACHE_SHEET_NAME);
+
+  if (cacheSheet) {
+    ss.deleteSheet(cacheSheet);
+  }
+
+  Logger.log('Change-detection state cleared; next sync will refetch every contact.');
+}
 
 // =============================================================================
-// MAIN ENTRY POINT
+// MAIN SYNC
 // =============================================================================
 
-/**
- * Main sync function. Call this manually or via a time-driven trigger.
- */
-/**
- * Main entry point. Starts a fresh sync run (resets any in-progress state).
- */
 function syncQuoContactsToSheet() {
   var props = PropertiesService.getScriptProperties();
   props.deleteProperty(PROP_SYNC_OFFSET);
@@ -128,125 +159,118 @@ function syncQuoContactsToSheet() {
   runSyncChunk_();
 }
 
-/**
- * Continuation callback fired by the time-based trigger we schedule
- * between chunks. Resumes from the saved offset.
- */
 function quoSyncContinue_() {
   runSyncChunk_();
 }
 
-/**
- * Processes one chunk of contacts, then either schedules the next chunk
- * or wraps up the sync.
- */
 function runSyncChunk_() {
   var runStart = new Date();
   var props = PropertiesService.getScriptProperties();
   var offset = parseInt(props.getProperty(PROP_SYNC_OFFSET) || '0', 10);
-  var syncStartedAt = props.getProperty(PROP_SYNC_STARTED_AT) || runStart.toISOString();
-  var isFirstChunk = (offset === 0);
+  var isFirstChunk = offset === 0;
 
-  Logger.log('=== Quo Sync chunk starting (offset=' + offset + ') ===');
+  Logger.log('=== Quo Sync chunk starting, offset=' + offset + ' ===');
 
   var sheet = setupSheet();
   var phoneNumberIds = fetchAllPhoneNumberIds();
-  Logger.log('Quo phone numbers: ' + phoneNumberIds.length);
+  var userIds = fetchAllUserIds();
+
+  Logger.log('Quo inbox phone numbers found: ' + phoneNumberIds.length);
+  Logger.log('Quo users found: ' + userIds.length);
 
   var contacts = fetchAllContacts();
+  contacts.sort(function(a, b) {
+    return String(a.id || '').localeCompare(String(b.id || ''));
+  });
+
   Logger.log('Total contacts fetched: ' + contacts.length);
 
-  // Write basic rows for all contacts on the first chunk so the sheet is
-  // populated immediately — activity columns will be filled chunk by chunk.
   if (isFirstChunk) {
-    writeBasicContactRows_(sheet, contacts, syncStartedAt);
+    writeBasicContactRows_(sheet, contacts);
   }
 
-  // Build a set of normalized contact phones — we filter the conversation
-  // map to these so we only fetch activity for contacts we care about.
-  var contactPhoneSet = {};
-  var contactsByPhone = {};
-  for (var c = 0; c < contacts.length; c++) {
-    var phone = normalizePhone(getPrimaryPhone((contacts[c].defaultFields || {}).phoneNumbers));
-    if (phone) {
-      contactPhoneSet[phone] = true;
-      contactsByPhone[phone] = contacts[c];
-    }
-  }
-
-  // Build conversation map filtered to contacts only
-  var conversationMap = buildConversationMap(phoneNumberIds, contactPhoneSet);
-  Logger.log('Active contact conversations: ' + Object.keys(conversationMap).length);
-
-  // Deterministic ordering so offset is stable across runs
-  var activePhones = Object.keys(conversationMap).sort();
-  var total = activePhones.length;
-
-  // Read existing rows once for in-place updates
+  var contactPhoneSet = buildContactPhoneSet_(contacts);
+  var conversationActivityMap = getConversationActivityMapForRun_(phoneNumberIds, contactPhoneSet, isFirstChunk);
   var existingMap = readExistingRows(sheet);
 
   var processed = 0;
-  var cutoff = offset + CONFIG.CHUNK_SIZE;
+  var total = contacts.length;
+  var cutoff = Math.min(offset + CONFIG.CHUNK_SIZE, total);
 
-  for (var i = offset; i < total && i < cutoff; i++) {
-    // Respect the wall-clock safety budget too, in case fetches are slow
+  for (var i = offset; i < cutoff; i++) {
     if (new Date() - runStart > CONFIG.MAX_RUNTIME_MS) {
-      Logger.log('Chunk hit runtime budget at offset ' + i);
+      Logger.log('Chunk hit runtime budget at contact index ' + i);
       break;
     }
 
-    var phone = activePhones[i];
-    var contact = contactsByPhone[phone];
-    if (!contact) { processed++; continue; }
+    var contact = contacts[i];
 
-    var pnIds = conversationMap[phone];
-    var calls = [];
-    var messages = [];
-
-    for (var pn = 0; pn < pnIds.length; pn++) {
-      calls = calls.concat(fetchAllPages('/calls', {
-        phoneNumberId: pnIds[pn], participants: [phone]
-      }, CONFIG.CALLS_PAGE_SIZE));
-
-      messages = messages.concat(fetchAllPages('/messages', {
-        phoneNumberId: pnIds[pn], participants: [phone]
-      }, CONFIG.MESSAGES_PAGE_SIZE));
+    if (!contact || !contact.id) {
+      processed++;
+      continue;
     }
 
-    var voicemailCache = fetchVoicemailsForCalls(calls);
-    var classified = classifyCalls(calls, voicemailCache);
-    var textActivity = computeTextActivityFromMessages(messages);
-
-    // Build updated row
     var df = contact.defaultFields || {};
     var name = ((df.firstName || '') + ' ' + (df.lastName || '')).trim();
-    var row = buildContactRow(
-      contact.id,
-      name,
-      df.company || '',
-      getPrimaryPhone(df.phoneNumbers),
-      getPrimaryEmail(df.emails),
-      classified,
-      textActivity,
-      new Date()
-    );
+    var primaryPhone = getPrimaryPhone(df.phoneNumbers);
+    var email = getPrimaryEmail(df.emails);
+    var contactPhones = getAllPhones(df.phoneNumbers);
+    var lastConversationActivityAt = latestConversationActivityForPhones_(contactPhones, conversationActivityMap);
+    var existing = existingMap[contact.id] || null;
+    var existingConversationActivityAt = existing
+      ? valueToComparableString_(existing.data[COL['Last Conversation Activity At']])
+      : '';
 
-    // Update in place (row must already exist from the first-chunk basic write)
-    if (existingMap[contact.id]) {
-      sheet.getRange(existingMap[contact.id].rowIndex, 1, 1, HEADERS.length)
-           .setValues([row]);
+    Logger.log('Processing contact: ' + contact.id + ' | ' + name + ' | ' + contactPhones.join(', '));
+    Logger.log('Last conversation activity: ' + lastConversationActivityAt);
+
+    var row;
+
+    if (existing && existingConversationActivityAt === lastConversationActivityAt) {
+      row = buildSkippedExistingRow_(
+        existing.data,
+        contact.id,
+        name,
+        df.company || '',
+        primaryPhone,
+        email,
+        lastConversationActivityAt,
+        new Date()
+      );
+
+      Logger.log('Skipped expensive activity fetch because conversation activity is unchanged.');
+    } else {
+      row = buildFreshActivityRow_(
+        contact.id,
+        name,
+        df.company || '',
+        primaryPhone,
+        email,
+        contactPhones,
+        phoneNumberIds,
+        userIds,
+        lastConversationActivityAt,
+        new Date()
+      );
+    }
+
+    if (existing) {
+      sheet.getRange(existing.rowIndex, 1, 1, HEADERS.length).setValues([row]);
     } else {
       sheet.appendRow(row);
+      existingMap[contact.id] = {
+        rowIndex: sheet.getLastRow(),
+        data: row
+      };
     }
 
     processed++;
   }
 
   var newOffset = offset + processed;
-  Logger.log('Processed ' + processed + ' contacts this chunk (' + offset + ' → ' + newOffset + ' of ' + total + ')');
+  Logger.log('Processed ' + processed + ' contacts this chunk: ' + offset + ' -> ' + newOffset + ' of ' + total);
 
   if (newOffset >= total) {
-    // Done
     props.deleteProperty(PROP_SYNC_OFFSET);
     props.deleteProperty(PROP_SYNC_STARTED_AT);
     clearContinuationTriggers_();
@@ -254,82 +278,130 @@ function runSyncChunk_() {
   } else {
     props.setProperty(PROP_SYNC_OFFSET, String(newOffset));
     scheduleContinuation_();
-    Logger.log('Scheduled next chunk in ' + CONFIG.CHUNK_DELAY_SECONDS + 's; offset now ' + newOffset);
+    Logger.log('Scheduled next chunk in ' + CONFIG.CHUNK_DELAY_SECONDS + ' seconds; offset now ' + newOffset);
   }
 }
 
-/**
- * Writes a starter row for every contact with basic fields filled in.
- * Activity columns are left blank and get populated as each chunk runs.
- */
-function writeBasicContactRows_(sheet, contacts, syncStartedAt) {
+function buildFreshActivityRow_(contactId, name, company, primaryPhone, email, contactPhones, phoneNumberIds, userIds, lastConversationActivityAt, syncTime) {
+  var activity = {
+    calls: [],
+    messages: []
+  };
+
+  var classified = emptyClassified_();
+  var textActivity = emptyTextActivity_();
+  var languageSample = '';
+
+  if (lastConversationActivityAt || contactPhones.length > 0) {
+    activity = fetchActivityForContactPhones_(contactPhones, phoneNumberIds, userIds);
+    Logger.log('Activity fetched: calls=' + activity.calls.length + ', messages=' + activity.messages.length);
+
+    var voicemailCache = fetchVoicemailsForCalls(activity.calls);
+    classified = classifyCalls(activity.calls, voicemailCache);
+    textActivity = computeTextActivityFromMessages(activity.messages);
+    languageSample = buildLanguageSampleForContact_(activity.calls, voicemailCache, activity.messages, contactPhones);
+  }
+
+  Logger.log('Latest inbound completed: ' + classified.lastCompletedInbound);
+  Logger.log('Latest any call: ' + classified.lastAnyCallAt);
+
+  return buildContactRow(
+    contactId,
+    name,
+    company,
+    primaryPhone,
+    email,
+    classified,
+    textActivity,
+    lastConversationActivityAt,
+    languageSample,
+    syncTime
+  );
+}
+
+function buildSkippedExistingRow_(existingData, contactId, name, company, primaryPhone, email, lastConversationActivityAt, syncTime) {
+  var row = existingData.slice();
+
+  while (row.length < HEADERS.length) {
+    row.push('');
+  }
+
+  row[COL['Contact ID']] = contactId;
+  row[COL['Name']] = name;
+  row[COL['Company']] = company;
+  row[COL['Primary Phone']] = primaryPhone;
+  row[COL['Email']] = email;
+  row[COL['Last Conversation Activity At']] = lastConversationActivityAt;
+  row[COL['Days Since Last Contact']] = calculateDaysSince_(row[COL['Last Any Contact At']]);
+  row[COL['Last Sync At']] = syncTime.toISOString();
+
+  return row;
+}
+
+function writeBasicContactRows_(sheet, contacts) {
   var existingMap = readExistingRows(sheet);
   var rowsToUpdate = [];
   var rowsToAppend = [];
 
   for (var i = 0; i < contacts.length; i++) {
     var contact = contacts[i];
+
     if (!contact.id) continue;
 
     var df = contact.defaultFields || {};
     var name = ((df.firstName || '') + ' ' + (df.lastName || '')).trim();
-    var phone = getPrimaryPhone(df.phoneNumbers);
-    var email = getPrimaryEmail(df.emails);
 
     if (existingMap[contact.id]) {
-      // Only overwrite the basic identity columns; preserve any existing
-      // activity data from previous syncs until this run's activity fetch
-      // replaces it.
       var existing = existingMap[contact.id].data.slice();
+
+      while (existing.length < HEADERS.length) {
+        existing.push('');
+      }
+
       existing[COL['Contact ID']] = contact.id;
       existing[COL['Name']] = name;
       existing[COL['Company']] = df.company || '';
-      existing[COL['Primary Phone']] = phone;
-      existing[COL['Email']] = email;
-      existing[COL['Last Sync At']] = syncStartedAt;
-      rowsToUpdate.push({ rowIndex: existingMap[contact.id].rowIndex, data: existing });
+      existing[COL['Primary Phone']] = getPrimaryPhone(df.phoneNumbers);
+      existing[COL['Email']] = getPrimaryEmail(df.emails);
+
+      rowsToUpdate.push({
+        rowIndex: existingMap[contact.id].rowIndex,
+        data: existing
+      });
     } else {
       var row = new Array(HEADERS.length).fill('');
       row[COL['Contact ID']] = contact.id;
       row[COL['Name']] = name;
       row[COL['Company']] = df.company || '';
-      row[COL['Primary Phone']] = phone;
-      row[COL['Email']] = email;
-      row[COL['Last Sync At']] = syncStartedAt;
+      row[COL['Primary Phone']] = getPrimaryPhone(df.phoneNumbers);
+      row[COL['Email']] = getPrimaryEmail(df.emails);
       rowsToAppend.push(row);
     }
   }
 
   for (var u = 0; u < rowsToUpdate.length; u++) {
-    sheet.getRange(rowsToUpdate[u].rowIndex, 1, 1, HEADERS.length)
-         .setValues([rowsToUpdate[u].data]);
+    sheet.getRange(rowsToUpdate[u].rowIndex, 1, 1, HEADERS.length).setValues([rowsToUpdate[u].data]);
   }
 
   if (rowsToAppend.length > 0) {
-    var startRow = sheet.getLastRow() + 1;
-    sheet.getRange(startRow, 1, rowsToAppend.length, HEADERS.length)
-         .setValues(rowsToAppend);
+    sheet.getRange(sheet.getLastRow() + 1, 1, rowsToAppend.length, HEADERS.length).setValues(rowsToAppend);
   }
 
   Logger.log('Basic rows written: ' + rowsToUpdate.length + ' updated, ' + rowsToAppend.length + ' appended');
 }
 
-/**
- * Creates a one-shot time-based trigger to resume the sync after a delay.
- */
 function scheduleContinuation_() {
   clearContinuationTriggers_();
+
   ScriptApp.newTrigger(CONTINUATION_TRIGGER_FN)
     .timeBased()
     .after(CONFIG.CHUNK_DELAY_SECONDS * 1000)
     .create();
 }
 
-/**
- * Removes any previously-scheduled continuation triggers.
- */
 function clearContinuationTriggers_() {
   var triggers = ScriptApp.getProjectTriggers();
+
   for (var t = 0; t < triggers.length; t++) {
     if (triggers[t].getHandlerFunction() === CONTINUATION_TRIGGER_FN) {
       ScriptApp.deleteTrigger(triggers[t]);
@@ -337,53 +409,131 @@ function clearContinuationTriggers_() {
   }
 }
 
+// =============================================================================
+// ONE-OFF CONTACT SYNC
+// =============================================================================
+
+function syncOneContactByPhonePrompt() {
+  var ui = SpreadsheetApp.getUi();
+  var response = ui.prompt(
+    'Sync One Contact',
+    'Enter the contact phone number, like +15124121624',
+    ui.ButtonSet.OK_CANCEL
+  );
+
+  if (response.getSelectedButton() !== ui.Button.OK) return;
+
+  syncOneContactByPhone_(response.getResponseText());
+}
+
+function syncOneContactByPhone_(phone) {
+  var normalizedPhone = normalizePhone(phone);
+  var sheet = setupSheet();
+  var contacts = fetchAllContacts();
+  var phoneNumberIds = fetchAllPhoneNumberIds();
+  var userIds = fetchAllUserIds();
+  var existingMap = readExistingRows(sheet);
+
+  Logger.log('Syncing one contact by phone: ' + normalizedPhone);
+
+  for (var i = 0; i < contacts.length; i++) {
+    var contact = contacts[i];
+    var df = contact.defaultFields || {};
+    var contactPhones = getAllPhones(df.phoneNumbers);
+
+    if (contactPhones.indexOf(normalizedPhone) === -1) continue;
+
+    var name = ((df.firstName || '') + ' ' + (df.lastName || '')).trim();
+    var company = df.company || '';
+    var primaryPhone = getPrimaryPhone(df.phoneNumbers);
+    var email = getPrimaryEmail(df.emails);
+
+    var contactPhoneSet = {};
+    for (var p = 0; p < contactPhones.length; p++) {
+      contactPhoneSet[contactPhones[p]] = true;
+    }
+
+    var conversationActivityMap = buildConversationActivityMap_(phoneNumberIds, contactPhoneSet);
+    var lastConversationActivityAt = latestConversationActivityForPhones_(contactPhones, conversationActivityMap);
+
+    var row = buildFreshActivityRow_(
+      contact.id,
+      name,
+      company,
+      primaryPhone,
+      email,
+      contactPhones,
+      phoneNumberIds,
+      userIds,
+      lastConversationActivityAt,
+      new Date()
+    );
+
+    if (existingMap[contact.id]) {
+      sheet.getRange(existingMap[contact.id].rowIndex, 1, 1, HEADERS.length).setValues([row]);
+      Logger.log('Updated existing row for ' + name + ' at row ' + existingMap[contact.id].rowIndex);
+    } else {
+      sheet.appendRow(row);
+      Logger.log('Appended new row for ' + name + ' at row ' + sheet.getLastRow());
+    }
+
+    return;
+  }
+
+  Logger.log('No Quo contact found with phone: ' + normalizedPhone);
+}
 
 // =============================================================================
-// SHEET SETUP & I/O
+// SHEET
 // =============================================================================
 
-/**
- * Creates the sheet and headers if they don't exist. Returns the sheet.
- */
 function setupSheet() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var sheet = ss.getSheetByName(CONFIG.SHEET_NAME);
 
   if (!sheet) {
     sheet = ss.insertSheet(CONFIG.SHEET_NAME);
-    Logger.log('Created new sheet: ' + CONFIG.SHEET_NAME);
   }
 
-  // Write headers if row 1 is empty or doesn't match
   var existingHeaders = sheet.getRange(1, 1, 1, HEADERS.length).getValues()[0];
-  var needsHeaders = !existingHeaders[0] || existingHeaders[0] !== HEADERS[0];
+  var needsHeaders = false;
+
+  for (var i = 0; i < HEADERS.length; i++) {
+    if (existingHeaders[i] !== HEADERS[i]) {
+      needsHeaders = true;
+      break;
+    }
+  }
 
   if (needsHeaders) {
     sheet.getRange(1, 1, 1, HEADERS.length).setValues([HEADERS]);
-    sheet.getRange(1, 1, 1, HEADERS.length).setFontWeight('bold');
     sheet.setFrozenRows(1);
-    Logger.log('Headers written to sheet.');
+  }
+
+  sheet.getRange(1, 1, 1, HEADERS.length).setFontWeight('bold');
+
+  if (sheet.getMaxRows() > 1) {
+    sheet.getRange(2, COL['Primary Phone'] + 1, sheet.getMaxRows() - 1, 1).setNumberFormat('@');
+    sheet.getRange(2, COL['Days Since Last Contact'] + 1, sheet.getMaxRows() - 1, 1).setNumberFormat('0');
   }
 
   return sheet;
 }
 
-/**
- * Reads all existing data rows into a map: { contactId: { rowIndex: N, data: [...] } }
- * rowIndex is 1-based (sheet row number).
- */
 function readExistingRows(sheet) {
   var map = {};
   var lastRow = sheet.getLastRow();
-  if (lastRow < 2) return map; // no data rows
+
+  if (lastRow < 2) return map;
 
   var data = sheet.getRange(2, 1, lastRow - 1, HEADERS.length).getValues();
 
   for (var i = 0; i < data.length; i++) {
-    var contactId = String(data[i][COL['Contact ID']]).trim();
+    var contactId = String(data[i][COL['Contact ID']] || '').trim();
+
     if (contactId) {
       map[contactId] = {
-        rowIndex: i + 2,  // +2 because data starts at row 2, array is 0-based
+        rowIndex: i + 2,
         data: data[i]
       };
     }
@@ -393,23 +543,22 @@ function readExistingRows(sheet) {
 }
 
 // =============================================================================
-// API FETCH HELPERS
+// API
 // =============================================================================
 
-/**
- * Makes a GET request to the Quo API with retry and backoff for rate limits.
- * Returns parsed JSON response or null on failure.
- */
-function quoApiFetch(endpoint, queryParams) {
+function quoApiFetch(endpoint, queryParams, options) {
+  options = options || {};
+
   var url = CONFIG.API_BASE + endpoint;
 
-  // Build query string
   if (queryParams) {
     var parts = [];
+
     for (var key in queryParams) {
       if (queryParams[key] === null || queryParams[key] === undefined) continue;
+
       var val = queryParams[key];
-      // Handle array parameters (e.g., participants[])
+
       if (Array.isArray(val)) {
         for (var a = 0; a < val.length; a++) {
           parts.push(encodeURIComponent(key) + '=' + encodeURIComponent(val[a]));
@@ -418,16 +567,16 @@ function quoApiFetch(endpoint, queryParams) {
         parts.push(encodeURIComponent(key) + '=' + encodeURIComponent(val));
       }
     }
+
     if (parts.length > 0) {
       url += '?' + parts.join('&');
     }
   }
 
-  var options = {
+  var fetchOptions = {
     method: 'get',
     headers: {
-      // Quo / OpenPhone expects the API key directly — NO "Bearer " prefix
-      'Authorization': CONFIG.API_KEY
+      Authorization: CONFIG.API_KEY
     },
     muteHttpExceptions: true
   };
@@ -436,27 +585,29 @@ function quoApiFetch(endpoint, queryParams) {
 
   for (var attempt = 0; attempt <= CONFIG.MAX_RETRIES; attempt++) {
     try {
-      var response = UrlFetchApp.fetch(url, options);
+      var response = UrlFetchApp.fetch(url, fetchOptions);
       var code = response.getResponseCode();
 
       if (code === 200) {
         return JSON.parse(response.getContentText());
       }
 
-      // Rate limited (429) or server error (5xx) — retry with backoff
+      if (options.silent403 && code === 403) {
+        return null;
+      }
+
       if (code === 429 || code >= 500) {
-        Logger.log('API returned ' + code + ' for ' + endpoint + ', retrying in ' + backoff + 'ms (attempt ' + (attempt + 1) + ')');
+        Logger.log('API returned ' + code + ' for ' + endpoint + ', retrying in ' + backoff + 'ms');
         Utilities.sleep(backoff);
         backoff *= 2;
         continue;
       }
 
-      // Other client errors — don't retry
-      Logger.log('API error ' + code + ' for ' + endpoint + ': ' + response.getContentText().substring(0, 200));
+      Logger.log('API error ' + code + ' for ' + endpoint + ': ' + response.getContentText().substring(0, 500));
       return null;
-
     } catch (e) {
       Logger.log('Fetch exception for ' + endpoint + ': ' + e.message);
+
       if (attempt < CONFIG.MAX_RETRIES) {
         Utilities.sleep(backoff);
         backoff *= 2;
@@ -468,93 +619,212 @@ function quoApiFetch(endpoint, queryParams) {
   return null;
 }
 
-/**
- * Paginates through a Quo API list endpoint, collecting all items.
- * @param {string} endpoint - API path (e.g., '/contacts')
- * @param {object} baseParams - Query params (excluding pageToken)
- * @param {string} maxResultsKey - The param name for page size (usually 'maxResults')
- * @param {number} pageSize - Number of results per page
- * @returns {Array} All items across all pages
- */
-function fetchAllPages(endpoint, baseParams, pageSize) {
+function fetchAllPages(endpoint, baseParams, pageSize, options) {
   var allItems = [];
   var pageToken = null;
 
   do {
     var params = {};
-    for (var k in baseParams) {
+
+    for (var k in baseParams || {}) {
       params[k] = baseParams[k];
     }
-    params['maxResults'] = pageSize;
+
+    params.maxResults = pageSize;
+
     if (pageToken) {
-      params['pageToken'] = pageToken;
+      params.pageToken = pageToken;
     }
 
-    var result = quoApiFetch(endpoint, params);
+    var result = quoApiFetch(endpoint, params, options);
+
     if (!result || !result.data) break;
 
     allItems = allItems.concat(result.data);
     pageToken = result.nextPageToken || null;
-
   } while (pageToken);
 
   return allItems;
 }
 
-
-// =============================================================================
-// DATA FETCHING FUNCTIONS
-// =============================================================================
-
-/**
- * Fetches all Quo phone number IDs (needed for calls/messages endpoints).
- * Returns array of phone number ID strings.
- */
-function fetchAllPhoneNumberIds() {
-  var result = quoApiFetch('/phone-numbers', {});
-  if (!result || !result.data) return [];
-
-  return result.data.map(function(pn) {
-    return pn.id;
-  });
-}
-
-/**
- * Fetches ALL contacts from Quo, handling pagination.
- */
 function fetchAllContacts() {
   return fetchAllPages('/contacts', {}, CONFIG.CONTACTS_PAGE_SIZE);
 }
 
-/**
- * Fetches all conversations and builds a map of contactPhone → [phoneNumberId, ...]
- * Filtered to only include phones that match a known contact, so we don't
- * waste time fetching activity for people who aren't in the contacts list.
- *
- * The /conversations endpoint does NOT require a participants filter.
- */
-function buildConversationMap(phoneNumberIds, contactPhoneSet) {
+function fetchAllPhoneNumberIds() {
+  var result = quoApiFetch('/phone-numbers', {});
+  var ids = [];
+
+  if (!result || !result.data) return ids;
+
+  for (var i = 0; i < result.data.length; i++) {
+    if (result.data[i].id && ids.indexOf(result.data[i].id) === -1) {
+      ids.push(result.data[i].id);
+    }
+  }
+
+  return ids;
+}
+
+function fetchAllUserIds() {
+  var users = fetchAllPages('/users', {}, CONFIG.USERS_PAGE_SIZE);
+  var ids = [];
+
+  for (var i = 0; i < users.length; i++) {
+    if (users[i].id && ids.indexOf(users[i].id) === -1) {
+      ids.push(users[i].id);
+    }
+  }
+
+  return ids;
+}
+
+// =============================================================================
+// ACTIVITY FETCHING
+// =============================================================================
+
+function fetchActivityForContactPhones_(contactPhones, allPhoneNumberIds, userIds) {
+  var calls = [];
+  var messages = [];
+  var seenCallIds = {};
+  var seenMessageIds = {};
+
+  if (!contactPhones || contactPhones.length === 0) {
+    return {
+      calls: calls,
+      messages: messages
+    };
+  }
+
+  userIds = userIds || [];
+
+  for (var p = 0; p < contactPhones.length; p++) {
+    var phone = contactPhones[p];
+
+    for (var n = 0; n < allPhoneNumberIds.length; n++) {
+      var pnId = allPhoneNumberIds[n];
+
+      var baseParams = {
+        phoneNumberId: pnId,
+        participants: [phone]
+      };
+
+      var callParamSets = [baseParams];
+
+      for (var u = 0; u < userIds.length; u++) {
+        callParamSets.push({
+          phoneNumberId: pnId,
+          participants: [phone],
+          userId: userIds[u]
+        });
+      }
+
+      for (var cp = 0; cp < callParamSets.length; cp++) {
+        var phoneCalls = fetchAllPages('/calls', callParamSets[cp], CONFIG.CALLS_PAGE_SIZE, {
+          silent403: true
+        });
+
+        for (var c = 0; c < phoneCalls.length; c++) {
+          var call = phoneCalls[c];
+          var callKey = call.id || JSON.stringify(call);
+
+          if (!seenCallIds[callKey]) {
+            seenCallIds[callKey] = true;
+            calls.push(call);
+          }
+        }
+      }
+
+      var messageParamSets = [baseParams];
+
+      for (var mu = 0; mu < userIds.length; mu++) {
+        messageParamSets.push({
+          phoneNumberId: pnId,
+          participants: [phone],
+          userId: userIds[mu]
+        });
+      }
+
+      for (var mp = 0; mp < messageParamSets.length; mp++) {
+        var phoneMessages = fetchAllPages('/messages', messageParamSets[mp], CONFIG.MESSAGES_PAGE_SIZE, {
+          silent403: true
+        });
+
+        for (var m = 0; m < phoneMessages.length; m++) {
+          var msg = phoneMessages[m];
+          var msgKey = msg.id || JSON.stringify(msg);
+
+          if (!seenMessageIds[msgKey]) {
+            seenMessageIds[msgKey] = true;
+            messages.push(msg);
+          }
+        }
+      }
+    }
+  }
+
+  return {
+    calls: calls,
+    messages: messages
+  };
+}
+
+function buildContactPhoneSet_(contacts) {
+  var set = {};
+
+  for (var i = 0; i < contacts.length; i++) {
+    var df = contacts[i].defaultFields || {};
+    var phones = getAllPhones(df.phoneNumbers);
+
+    for (var p = 0; p < phones.length; p++) {
+      set[phones[p]] = true;
+    }
+  }
+
+  return set;
+}
+
+function getConversationActivityMapForRun_(phoneNumberIds, contactPhoneSet, forceRebuild) {
+  if (!forceRebuild) {
+    var cached = readConversationActivityCache_();
+
+    if (Object.keys(cached).length > 0) {
+      Logger.log('Loaded conversation activity cache: ' + Object.keys(cached).length + ' phones');
+      return cached;
+    }
+  }
+
+  Logger.log('Building conversation activity cache...');
+  var map = buildConversationActivityMap_(phoneNumberIds, contactPhoneSet);
+  writeConversationActivityCache_(map);
+  Logger.log('Conversation activity cache built: ' + Object.keys(map).length + ' phones');
+
+  return map;
+}
+
+function buildConversationActivityMap_(phoneNumberIds, contactPhoneSet) {
   var map = {};
 
   for (var p = 0; p < phoneNumberIds.length; p++) {
     var conversations = fetchAllPages('/conversations', {
       phoneNumbers: [phoneNumberIds[p]]
-    }, 50);
+    }, CONFIG.CONVERSATIONS_PAGE_SIZE);
 
     for (var c = 0; c < conversations.length; c++) {
       var conv = conversations[c];
       var participants = conv.participants || [];
-      var pnId = conv.phoneNumberId || phoneNumberIds[p];
+      var ts = conv.lastActivityAt || conv.updatedAt || '';
+
+      if (!ts) continue;
 
       for (var x = 0; x < participants.length; x++) {
         var normalized = normalizePhone(participants[x]);
+
         if (!normalized) continue;
-        // Skip phones that don't belong to a known contact
         if (contactPhoneSet && !contactPhoneSet[normalized]) continue;
 
-        if (!map[normalized]) map[normalized] = [];
-        if (map[normalized].indexOf(pnId) === -1) {
-          map[normalized].push(pnId);
+        if (!map[normalized] || ts > map[normalized]) {
+          map[normalized] = ts;
         }
       }
     }
@@ -563,10 +833,70 @@ function buildConversationMap(phoneNumberIds, contactPhoneSet) {
   return map;
 }
 
-/**
- * Scans a contact's messages to find the most recent inbound/outbound timestamps
- * plus the content of the most recent inbound text (for language detection).
- */
+function readConversationActivityCache_() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var cacheSheet = ss.getSheetByName(CONFIG.CONVERSATION_CACHE_SHEET_NAME);
+  var map = {};
+
+  if (!cacheSheet || cacheSheet.getLastRow() < 2) return map;
+
+  var data = cacheSheet.getRange(2, 1, cacheSheet.getLastRow() - 1, 2).getValues();
+
+  for (var i = 0; i < data.length; i++) {
+    var phone = String(data[i][0] || '').trim();
+    var ts = valueToComparableString_(data[i][1]);
+
+    if (phone && ts) {
+      map[phone] = ts;
+    }
+  }
+
+  return map;
+}
+
+function writeConversationActivityCache_(map) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var cacheSheet = ss.getSheetByName(CONFIG.CONVERSATION_CACHE_SHEET_NAME);
+
+  if (!cacheSheet) {
+    cacheSheet = ss.insertSheet(CONFIG.CONVERSATION_CACHE_SHEET_NAME);
+  }
+
+  cacheSheet.clear();
+  cacheSheet.getRange(1, 1, 1, 2).setValues([['Phone', 'Last Conversation Activity At']]);
+
+  var rows = [];
+
+  for (var phone in map) {
+    rows.push([phone, map[phone]]);
+  }
+
+  if (rows.length > 0) {
+    cacheSheet.getRange(2, 1, rows.length, 2).setValues(rows);
+  }
+
+  try {
+    cacheSheet.hideSheet();
+  } catch (e) {
+    Logger.log('Could not hide cache sheet: ' + e.message);
+  }
+}
+
+function latestConversationActivityForPhones_(contactPhones, conversationActivityMap) {
+  var latest = '';
+
+  for (var i = 0; i < contactPhones.length; i++) {
+    var phone = normalizePhone(contactPhones[i]);
+    var ts = conversationActivityMap[phone] || '';
+
+    if (ts && ts > latest) {
+      latest = ts;
+    }
+  }
+
+  return latest;
+}
+
 function computeTextActivityFromMessages(messages) {
   var lastInbound = '';
   var lastOutbound = '';
@@ -574,15 +904,17 @@ function computeTextActivityFromMessages(messages) {
 
   for (var m = 0; m < messages.length; m++) {
     var msg = messages[m];
-    var ts = msg.createdAt || '';
-    // ── FIELD MAPPING: direction is "incoming" or "outgoing" ──
-    var dir = (msg.direction || '').toLowerCase();
+    var ts = getMessageTimestamp_(msg);
+    var dir = normalizeDirection_(msg.direction);
 
-    if (dir === 'incoming' && ts > lastInbound) {
+    if (!ts) continue;
+
+    if (dir === 'inbound' && ts > lastInbound) {
       lastInbound = ts;
-      // ── FIELD MAPPING: message body field is `text` ──
       lastInboundText = msg.text || '';
-    } else if (dir === 'outgoing' && ts > lastOutbound) {
+    }
+
+    if (dir === 'outbound' && ts > lastOutbound) {
       lastOutbound = ts;
     }
   }
@@ -594,27 +926,26 @@ function computeTextActivityFromMessages(messages) {
   };
 }
 
-/**
- * Fetches voicemail details for missed calls.
- * Voicemails most commonly arrive on missed calls; limiting to those keeps
- * the request count manageable on large datasets.
- * Returns a cache: { callId: { transcript, duration, direction, createdAt } }
- */
 function fetchVoicemailsForCalls(allCalls) {
   var cache = {};
 
   for (var i = 0; i < allCalls.length; i++) {
     var call = allCalls[i];
-    var status = (call.status || '').toLowerCase();
-    if (status !== 'missed') continue;
+    var status = String(call.status || '').toLowerCase();
 
-    var vmResult = quoApiFetch('/call-voicemails/' + call.id, {});
+    if (status !== 'missed' && status !== 'completed') continue;
+    if (!call.id) continue;
+
+    var vmResult = quoApiFetch('/call-voicemails/' + call.id, {}, {
+      silent403: true
+    });
+
     if (vmResult && vmResult.data && vmResult.data.transcript) {
       cache[call.id] = {
         transcript: vmResult.data.transcript || '',
         duration: vmResult.data.duration || 0,
         direction: call.direction,
-        createdAt: call.createdAt
+        createdAt: getCallTimestamp_(call)
       };
     }
   }
@@ -622,18 +953,20 @@ function fetchVoicemailsForCalls(allCalls) {
   return cache;
 }
 
-
 // =============================================================================
-// CALL CLASSIFICATION
+// CLASSIFICATION
 // =============================================================================
 
-/**
- * Classifies an array of calls into categories.
- * Returns an object with the latest timestamp for each category,
- * plus voicemail transcript info.
- */
-function classifyCalls(calls, voicemailCache) {
-  var result = {
+function emptyTextActivity_() {
+  return {
+    lastInbound: '',
+    lastOutbound: '',
+    lastInboundText: ''
+  };
+}
+
+function emptyClassified_() {
+  return {
     lastCompletedInbound: '',
     lastCompletedOutbound: '',
     lastMissedInbound: '',
@@ -642,65 +975,92 @@ function classifyCalls(calls, voicemailCache) {
     lastSonaOutbound: '',
     lastVoicemailInbound: '',
     lastVoicemailOutbound: '',
-    // Most recent INBOUND voicemail transcript — used only for language detection.
-    // We care about what the contact said, not what we said.
     lastInboundVoicemailTranscript: '',
-    lastInboundVoicemailAt: ''
+    lastInboundVoicemailAt: '',
+    lastAnyInboundCall: '',
+    lastAnyOutboundCall: '',
+    lastAnyCallAt: '',
+    lastAnyCallDirection: '',
+    lastAnyCallStatus: '',
+    lastAnyCallIsSona: false,
+    lastAnyCallHasVoicemail: false
   };
+}
+
+function classifyCalls(calls, voicemailCache) {
+  var result = emptyClassified_();
 
   for (var i = 0; i < calls.length; i++) {
     var call = calls[i];
-    var ts = call.createdAt || '';
-    // ── FIELD MAPPING: direction values are "incoming" / "outgoing" ──
-    var dir = (call.direction || '').toLowerCase();
-    var status = (call.status || '').toLowerCase();
-    // ── FIELD MAPPING: aiHandled is "ai-agent" when Sona handled, null otherwise ──
-    var isSona = !!(call.aiHandled);
-    var hasVoicemail = !!(voicemailCache[call.id]);
+    var ts = getCallTimestamp_(call);
+    var dir = normalizeDirection_(call.direction);
+    var status = String(call.status || '').toLowerCase();
+    var isSona = !!call.aiHandled;
+    var hasVoicemail = !!voicemailCache[call.id];
 
-    // --- Voicemail tracking (any call with a voicemail) ---
+    if (!ts) continue;
+
+    if (dir === 'inbound' && ts > result.lastAnyInboundCall) {
+      result.lastAnyInboundCall = ts;
+    }
+
+    if (dir === 'outbound' && ts > result.lastAnyOutboundCall) {
+      result.lastAnyOutboundCall = ts;
+    }
+
+    if (ts > result.lastAnyCallAt) {
+      result.lastAnyCallAt = ts;
+      result.lastAnyCallDirection = dir;
+      result.lastAnyCallStatus = status || 'unknown';
+      result.lastAnyCallIsSona = isSona;
+      result.lastAnyCallHasVoicemail = hasVoicemail;
+    }
+
     if (hasVoicemail) {
       var vmData = voicemailCache[call.id];
-      if (dir === 'incoming' && ts > result.lastVoicemailInbound) {
+
+      if (dir === 'inbound' && ts > result.lastVoicemailInbound) {
         result.lastVoicemailInbound = ts;
-        // Keep the most recent inbound transcript for language detection
+
         if (ts > result.lastInboundVoicemailAt) {
           result.lastInboundVoicemailAt = ts;
           result.lastInboundVoicemailTranscript = vmData.transcript || '';
         }
       }
-      if (dir === 'outgoing' && ts > result.lastVoicemailOutbound) {
+
+      if (dir === 'outbound' && ts > result.lastVoicemailOutbound) {
         result.lastVoicemailOutbound = ts;
       }
     }
 
-    // --- Sona / AI-handled calls ---
     if (isSona) {
-      if (dir === 'incoming' && ts > result.lastSonaInbound) {
+      if (dir === 'inbound' && ts > result.lastSonaInbound) {
         result.lastSonaInbound = ts;
       }
-      if (dir === 'outgoing' && ts > result.lastSonaOutbound) {
+
+      if (dir === 'outbound' && ts > result.lastSonaOutbound) {
         result.lastSonaOutbound = ts;
       }
-      continue; // Sona calls don't count as completed human or missed
+
+      continue;
     }
 
-    // --- Completed human calls (NOT Sona) ---
-    if (status === 'completed') {
-      if (dir === 'incoming' && ts > result.lastCompletedInbound) {
+    if (status === 'completed' || status === 'answered') {
+      if (dir === 'inbound' && ts > result.lastCompletedInbound) {
         result.lastCompletedInbound = ts;
       }
-      if (dir === 'outgoing' && ts > result.lastCompletedOutbound) {
+
+      if (dir === 'outbound' && ts > result.lastCompletedOutbound) {
         result.lastCompletedOutbound = ts;
       }
     }
 
-    // --- Missed calls (NOT Sona) ---
-    if (status === 'missed') {
-      if (dir === 'incoming' && ts > result.lastMissedInbound) {
+    if (status === 'missed' || status === 'no-answer' || status === 'no_answer') {
+      if (dir === 'inbound' && ts > result.lastMissedInbound) {
         result.lastMissedInbound = ts;
       }
-      if (dir === 'outgoing' && ts > result.lastMissedOutbound) {
+
+      if (dir === 'outbound' && ts > result.lastMissedOutbound) {
         result.lastMissedOutbound = ts;
       }
     }
@@ -709,315 +1069,713 @@ function classifyCalls(calls, voicemailCache) {
   return result;
 }
 
-
 // =============================================================================
-// ROW BUILDING & ROLLUPS
+// ROW BUILDING
 // =============================================================================
 
-/**
- * Builds a complete row array for one contact.
- */
-function buildContactRow(contactId, name, company, primaryPhone, email,
-                         classified, textActivity, syncTime) {
-  // Rollup: Last Completed Human Call At
+function buildContactRow(contactId, name, company, primaryPhone, email, classified, textActivity, lastConversationActivityAt, languageSample, syncTime) {
   var lastCompletedHumanCall = latestOf([
     classified.lastCompletedInbound,
     classified.lastCompletedOutbound
   ]);
 
-  // Rollup: Last Text At
-  var lastText = latestOf([textActivity.lastInbound, textActivity.lastOutbound]);
+  var lastText = latestOf([
+    textActivity.lastInbound,
+    textActivity.lastOutbound
+  ]);
 
-  // Rollup: Last Missed Call At
   var lastMissedCall = latestOf([
     classified.lastMissedInbound,
     classified.lastMissedOutbound
   ]);
 
-  // Rollup: Last Sona Call At
   var lastSonaCall = latestOf([
     classified.lastSonaInbound,
     classified.lastSonaOutbound
   ]);
 
-  // Rollup: Last Voicemail At
   var lastVoicemail = latestOf([
     classified.lastVoicemailInbound,
     classified.lastVoicemailOutbound
   ]);
 
-  // Rollup: Last Outbound Call At — any outbound call attempt
-  // (completed, missed, Sona, or voicemail we left).
   var lastOutboundCall = latestOf([
+    classified.lastAnyOutboundCall,
     classified.lastCompletedOutbound,
     classified.lastMissedOutbound,
     classified.lastSonaOutbound,
     classified.lastVoicemailOutbound
   ]);
 
-  // Rollup: Last Any Call At (completed human + missed + sona + voicemail)
   var lastAnyCall = latestOf([
+    classified.lastAnyCallAt,
     lastCompletedHumanCall,
     lastMissedCall,
     lastSonaCall,
     lastVoicemail
   ]);
 
-  // Rollup: Last Any Contact At (calls + texts)
-  var lastAnyContact = latestOf([lastAnyCall, lastText]);
+  var lastAnyContact = latestOf([
+    lastAnyCall,
+    lastText,
+    lastConversationActivityAt
+  ]);
 
-  // Language detection — pick the most recent inbound sample from the contact.
-  // Voicemail transcript vs inbound text; whichever is more recent wins.
-  var languageSample = '';
-  if (classified.lastInboundVoicemailAt > textActivity.lastInbound) {
-    languageSample = classified.lastInboundVoicemailTranscript;
-  } else {
-    languageSample = textActivity.lastInboundText || classified.lastInboundVoicemailTranscript;
-  }
   var lastLanguageUsed = detectLanguage(languageSample);
+  var lastContactInfo = determineLastContactType(classified, textActivity);
 
-  // Determine Last Contact Type and Direction
-  var lastContactInfo = determineLastContactType(classified, textActivity, lastAnyContact);
-
-  // Days Since Last Contact
-  var daysSince = '';
-  if (lastAnyContact) {
-    var lastDate = new Date(lastAnyContact);
-    var now = new Date();
-    daysSince = Math.floor((now - lastDate) / (1000 * 60 * 60 * 24));
+  if (lastConversationActivityAt && lastConversationActivityAt > latestOf([lastAnyCall, lastText])) {
+    lastContactInfo = {
+      type: 'conversation_activity',
+      direction: ''
+    };
   }
 
-  // Build the row in exact column order
-  var row = new Array(HEADERS.length);
-  row[COL['Contact ID']]                      = contactId;
-  row[COL['Name']]                             = name;
-  row[COL['Company']]                          = company;
-  row[COL['Primary Phone']]                    = primaryPhone;
-  row[COL['Email']]                            = email;
-  row[COL['Last Completed Inbound Call At']]   = classified.lastCompletedInbound;
-  row[COL['Last Completed Outbound Call At']]  = classified.lastCompletedOutbound;
-  row[COL['Last Completed Human Call At']]     = lastCompletedHumanCall;
-  row[COL['Last Inbound Text At']]             = textActivity.lastInbound;
-  row[COL['Last Outbound Text At']]            = textActivity.lastOutbound;
-  row[COL['Last Text At']]                     = lastText;
-  row[COL['Last Missed Call At']]              = lastMissedCall;
-  row[COL['Last Missed Inbound Call At']]      = classified.lastMissedInbound;
-  row[COL['Last Missed Outbound Call At']]     = classified.lastMissedOutbound;
-  row[COL['Last Sona Call At']]                = lastSonaCall;
-  row[COL['Last Sona Inbound Call At']]        = classified.lastSonaInbound;
-  row[COL['Last Sona Outbound Call At']]       = classified.lastSonaOutbound;
-  row[COL['Last Voicemail At']]                = lastVoicemail;
-  row[COL['Last Inbound Voicemail At']]        = classified.lastVoicemailInbound;
-  row[COL['Last Outbound Voicemail At']]       = classified.lastVoicemailOutbound;
-  row[COL['Last Language Used']]               = lastLanguageUsed;
-  row[COL['Last Outbound Call At']]            = lastOutboundCall;
-  row[COL['Last Any Call At']]                 = lastAnyCall;
-  row[COL['Last Any Contact At']]              = lastAnyContact;
-  row[COL['Last Contact Type']]                = lastContactInfo.type;
-  row[COL['Last Contact Direction']]           = lastContactInfo.direction;
-  row[COL['Days Since Last Contact']]          = daysSince;
-  row[COL['Last Sync At']]                     = syncTime.toISOString();
+  var row = new Array(HEADERS.length).fill('');
+
+  row[COL['Contact ID']] = contactId;
+  row[COL['Name']] = name;
+  row[COL['Company']] = company;
+  row[COL['Primary Phone']] = primaryPhone;
+  row[COL['Email']] = email;
+  row[COL['Last Completed Inbound Call At']] = classified.lastCompletedInbound;
+  row[COL['Last Completed Outbound Call At']] = classified.lastCompletedOutbound;
+  row[COL['Last Completed Human Call At']] = lastCompletedHumanCall;
+  row[COL['Last Inbound Text At']] = textActivity.lastInbound;
+  row[COL['Last Outbound Text At']] = textActivity.lastOutbound;
+  row[COL['Last Text At']] = lastText;
+  row[COL['Last Missed Call At']] = lastMissedCall;
+  row[COL['Last Missed Inbound Call At']] = classified.lastMissedInbound;
+  row[COL['Last Missed Outbound Call At']] = classified.lastMissedOutbound;
+  row[COL['Last Sona Call At']] = lastSonaCall;
+  row[COL['Last Sona Inbound Call At']] = classified.lastSonaInbound;
+  row[COL['Last Sona Outbound Call At']] = classified.lastSonaOutbound;
+  row[COL['Last Voicemail At']] = lastVoicemail;
+  row[COL['Last Inbound Voicemail At']] = classified.lastVoicemailInbound;
+  row[COL['Last Outbound Voicemail At']] = classified.lastVoicemailOutbound;
+  row[COL['Last Language Used']] = lastLanguageUsed;
+  row[COL['Last Outbound Call At']] = lastOutboundCall;
+  row[COL['Last Any Call At']] = lastAnyCall;
+  row[COL['Last Any Contact At']] = lastAnyContact;
+  row[COL['Last Contact Type']] = lastContactInfo.type;
+  row[COL['Last Contact Direction']] = lastContactInfo.direction;
+  row[COL['Last Conversation Activity At']] = lastConversationActivityAt;
+  row[COL['Days Since Last Contact']] = calculateDaysSince_(lastAnyContact);
+  row[COL['Last Sync At']] = syncTime.toISOString();
 
   return row;
 }
 
-/**
- * Returns the latest (max) ISO timestamp from an array of timestamps.
- * Ignores empty/falsy values. Returns '' if none.
- */
+function determineLastContactType(classified, textActivity) {
+  var genericCallType = '';
+
+  if (classified.lastAnyCallAt) {
+    if (classified.lastAnyCallIsSona) {
+      genericCallType = 'sona_' + classified.lastAnyCallDirection + '_call';
+    } else if (classified.lastAnyCallHasVoicemail) {
+      genericCallType = classified.lastAnyCallDirection + '_voicemail';
+    } else {
+      genericCallType = classified.lastAnyCallStatus + '_' + classified.lastAnyCallDirection + '_call';
+    }
+  }
+
+  var events = [
+    { ts: classified.lastCompletedInbound, type: 'completed_inbound_call', direction: 'inbound' },
+    { ts: classified.lastCompletedOutbound, type: 'completed_outbound_call', direction: 'outbound' },
+    { ts: classified.lastMissedInbound, type: 'missed_inbound_call', direction: 'inbound' },
+    { ts: classified.lastMissedOutbound, type: 'missed_outbound_call', direction: 'outbound' },
+    { ts: classified.lastSonaInbound, type: 'sona_inbound_call', direction: 'inbound' },
+    { ts: classified.lastSonaOutbound, type: 'sona_outbound_call', direction: 'outbound' },
+    { ts: classified.lastVoicemailInbound, type: 'inbound_voicemail', direction: 'inbound' },
+    { ts: classified.lastVoicemailOutbound, type: 'outbound_voicemail', direction: 'outbound' },
+    { ts: textActivity.lastInbound, type: 'inbound_text', direction: 'inbound' },
+    { ts: textActivity.lastOutbound, type: 'outbound_text', direction: 'outbound' },
+    { ts: classified.lastAnyCallAt, type: genericCallType, direction: classified.lastAnyCallDirection }
+  ];
+
+  var best = {
+    ts: '',
+    type: '',
+    direction: ''
+  };
+
+  for (var i = 0; i < events.length; i++) {
+    if (events[i].ts && events[i].ts > best.ts) {
+      best = events[i];
+    }
+  }
+
+  return {
+    type: best.type,
+    direction: best.direction
+  };
+}
+
 function latestOf(timestamps) {
   var latest = '';
+
   for (var i = 0; i < timestamps.length; i++) {
     if (timestamps[i] && timestamps[i] > latest) {
       latest = timestamps[i];
     }
   }
+
   return latest;
 }
 
-/**
- * Determines the type and direction of the most recent contact event.
- * Returns { type: 'completed_inbound_call', direction: 'inbound' }
- */
-function determineLastContactType(classified, textActivity, lastAnyContact) {
-  if (!lastAnyContact) return { type: '', direction: '' };
+// =============================================================================
+// UTILITIES
+// =============================================================================
 
-  // Build a list of all events with their timestamps, types, and directions
-  var events = [
-    { ts: classified.lastCompletedInbound,   type: 'completed_inbound_call',  direction: 'inbound'  },
-    { ts: classified.lastCompletedOutbound,  type: 'completed_outbound_call', direction: 'outbound' },
-    { ts: classified.lastMissedInbound,      type: 'missed_inbound_call',     direction: 'inbound'  },
-    { ts: classified.lastMissedOutbound,     type: 'missed_outbound_call',    direction: 'outbound' },
-    { ts: classified.lastSonaInbound,        type: 'sona_inbound_call',       direction: 'inbound'  },
-    { ts: classified.lastSonaOutbound,       type: 'sona_outbound_call',      direction: 'outbound' },
-    { ts: classified.lastVoicemailInbound,   type: 'inbound_voicemail',       direction: 'inbound'  },
-    { ts: classified.lastVoicemailOutbound,  type: 'outbound_voicemail',      direction: 'outbound' },
-    { ts: textActivity.lastInbound,          type: 'inbound_text',            direction: 'inbound'  },
-    { ts: textActivity.lastOutbound,         type: 'outbound_text',           direction: 'outbound' }
-  ];
-
-  // Find the event matching lastAnyContact
-  var best = { type: '', direction: '' };
-  var bestTs = '';
-
-  for (var i = 0; i < events.length; i++) {
-    if (events[i].ts && events[i].ts > bestTs) {
-      bestTs = events[i].ts;
-      best.type = events[i].type;
-      best.direction = events[i].direction;
-    }
-  }
-
-  return best;
+function getCallTimestamp_(call) {
+  return call.createdAt || call.answeredAt || call.completedAt || call.updatedAt || '';
 }
 
+function getMessageTimestamp_(msg) {
+  return msg.createdAt || msg.updatedAt || '';
+}
 
-// =============================================================================
-// UTILITY HELPERS
-// =============================================================================
+function normalizeDirection_(direction) {
+  var dir = String(direction || '').toLowerCase();
 
-/**
- * Normalizes a phone number to E.164-ish format for matching.
- * Strips everything except digits, then prepends '+' if needed.
- * Returns '' if input is empty.
- */
+  if (dir === 'incoming') return 'inbound';
+  if (dir === 'outgoing') return 'outbound';
+
+  return dir;
+}
+
 function normalizePhone(phone) {
   if (!phone) return '';
-  var digits = String(phone).replace(/[^\d+]/g, '');
+
+  var raw = String(phone).trim();
+  var hasPlus = raw.charAt(0) === '+';
+  var digits = raw.replace(/[^\d]/g, '');
+
   if (!digits) return '';
-  // If it already starts with '+', keep it
-  if (digits.charAt(0) === '+') return digits;
-  // If 10 digits, assume US and prepend +1
+
+  if (hasPlus) return '+' + digits;
   if (digits.length === 10) return '+1' + digits;
-  // If 11 digits starting with 1, prepend +
   if (digits.length === 11 && digits.charAt(0) === '1') return '+' + digits;
-  // Otherwise prepend +
+
   return '+' + digits;
 }
 
-/**
- * Gets the first phone number value from a contact's phoneNumbers array.
- * ── FIELD MAPPING: phoneNumbers is an array of { name, value, id } ──
- */
+function getAllPhones(phoneNumbers) {
+  var phones = [];
+
+  if (!phoneNumbers || !Array.isArray(phoneNumbers)) return phones;
+
+  for (var i = 0; i < phoneNumbers.length; i++) {
+    var normalized = normalizePhone(phoneNumbers[i].value);
+
+    if (normalized && phones.indexOf(normalized) === -1) {
+      phones.push(normalized);
+    }
+  }
+
+  return phones;
+}
+
 function getPrimaryPhone(phoneNumbers) {
   if (!phoneNumbers || !Array.isArray(phoneNumbers) || phoneNumbers.length === 0) return '';
   return phoneNumbers[0].value || '';
 }
 
-/**
- * Gets the first email value from a contact's emails array.
- * ── FIELD MAPPING: emails is an array of { name, value, id } ──
- */
 function getPrimaryEmail(emails) {
   if (!emails || !Array.isArray(emails) || emails.length === 0) return '';
   return emails[0].value || '';
 }
 
-/**
- * Detects the language of a text sample.
- * Uses Google Cloud Translation API when GOOGLE_TRANSLATE_API_KEY is configured,
- * otherwise falls back to a lightweight keyword-based heuristic.
- * Returns 'English', 'Spanish', or '' if unclear.
- */
-// Module-level state for language detection.
-// Cache: same text → same result, so we don't re-detect duplicates.
-// Disabled flag: once Google Translate returns 429, skip it for the rest of
-// the run so we don't waste time on endless rate-limit hits.
-var _langCache = {};
-var _googleTranslateDisabled = false;
+function calculateDaysSince_(timestamp) {
+  var ts = valueToComparableString_(timestamp);
+
+  if (!ts) return '';
+
+  return Math.floor((new Date() - new Date(ts)) / (1000 * 60 * 60 * 24));
+}
+
+function valueToComparableString_(value) {
+  if (!value) return '';
+
+  if (Object.prototype.toString.call(value) === '[object Date]') {
+    return value.toISOString();
+  }
+
+  return String(value).trim();
+}
+
+// =============================================================================
+// LANGUAGE SAMPLING
+// =============================================================================
+// Only the contact's own words count as evidence of the language they speak:
+//
+//   1. Inbound text messages          - the contact typed them
+//   2. Inbound voicemail transcripts  - the contact spoke them
+//   3. Call transcript lines spoken by the contact's phone number
+//
+// Deliberately excluded: Quo call summaries (AI-written, always English),
+// outbound texts and voicemails (our staff wrote them, usually English even
+// with Spanish-speaking clients), and transcript lines attributed to one of
+// our users.
+// =============================================================================
+
+function buildLanguageSampleForContact_(calls, voicemailCache, messages, contactPhones) {
+  var samples = collectFreeLanguageSamples_(voicemailCache, messages);
+  var sample = pickLanguageSample_(samples);
+
+  // Texts and voicemails are free - we already have them. Call transcripts
+  // cost one request each, so only reach for them when the free evidence is
+  // too thin to judge (e.g. the contact only ever replies "ok").
+  if (countWords_(sample) >= CONFIG.MIN_LANGUAGE_SAMPLE_WORDS) {
+    return sample;
+  }
+
+  var transcriptSamples = fetchContactTranscriptSamples_(calls, contactPhones);
+
+  if (transcriptSamples.length === 0) {
+    return sample;
+  }
+
+  return pickLanguageSample_(samples.concat(transcriptSamples));
+}
+
+function collectFreeLanguageSamples_(voicemailCache, messages) {
+  var samples = [];
+
+  for (var m = 0; m < messages.length; m++) {
+    var msg = messages[m];
+
+    if (normalizeDirection_(msg.direction) !== 'inbound') continue;
+    if (!msg.text) continue;
+
+    samples.push({
+      ts: getMessageTimestamp_(msg),
+      text: msg.text,
+      source: 'inbound_text'
+    });
+  }
+
+  for (var callId in voicemailCache) {
+    var vm = voicemailCache[callId];
+
+    if (normalizeDirection_(vm.direction) !== 'inbound') continue;
+    if (!vm.transcript) continue;
+
+    samples.push({
+      ts: vm.createdAt || '',
+      text: vm.transcript,
+      source: 'inbound_voicemail'
+    });
+  }
+
+  return samples;
+}
+
+function fetchContactTranscriptSamples_(calls, contactPhones) {
+  var samples = [];
+  var phoneSet = {};
+
+  for (var p = 0; p < contactPhones.length; p++) {
+    phoneSet[contactPhones[p]] = true;
+  }
+
+  var candidates = calls.slice().filter(function(call) {
+    return call.id && getCallTimestamp_(call);
+  });
+
+  candidates.sort(function(a, b) {
+    return String(getCallTimestamp_(b)).localeCompare(String(getCallTimestamp_(a)));
+  });
+
+  var lookups = Math.min(candidates.length, CONFIG.MAX_TRANSCRIPT_LOOKUPS);
+
+  for (var i = 0; i < lookups; i++) {
+    var call = candidates[i];
+    var result = quoApiFetch('/call-transcripts/' + call.id, {}, {
+      silent403: true
+    });
+
+    if (!result || !result.data || !result.data.dialogue) continue;
+
+    var dialogue = result.data.dialogue;
+    var spokenByContact = [];
+
+    for (var d = 0; d < dialogue.length; d++) {
+      var segment = dialogue[d];
+
+      // userId means one of our team members was speaking, not the contact.
+      if (segment.userId) continue;
+      if (!segment.content) continue;
+      if (!phoneSet[normalizePhone(segment.identifier)]) continue;
+
+      spokenByContact.push(segment.content);
+    }
+
+    if (spokenByContact.length > 0) {
+      samples.push({
+        ts: getCallTimestamp_(call),
+        text: spokenByContact.join(' '),
+        source: 'call_transcript'
+      });
+    }
+  }
+
+  return samples;
+}
 
 /**
- * Detects the language of a text sample. Returns 'English', 'Spanish', or ''.
- * Strategy: run the local keyword heuristic first (fast, no network). Only
- * fall back to the free Google Translate endpoint for ambiguous cases, and
- * disable Google entirely once it starts rate-limiting.
+ * Picks the text to run detection on: newest evidence first, adding older
+ * samples only until there are enough words to judge confidently.
  */
+function pickLanguageSample_(samples) {
+  var usable = samples.filter(function(s) {
+    return s.text && String(s.text).trim();
+  });
+
+  usable.sort(function(a, b) {
+    return String(b.ts || '').localeCompare(String(a.ts || ''));
+  });
+
+  var parts = [];
+  var words = 0;
+
+  for (var i = 0; i < usable.length && i < CONFIG.MAX_LANGUAGE_SAMPLES; i++) {
+    parts.push(usable[i].text);
+    words += countWords_(usable[i].text);
+
+    if (words >= CONFIG.MIN_LANGUAGE_SAMPLE_WORDS) break;
+  }
+
+  return parts.join(' ');
+}
+
+function countWords_(text) {
+  if (!text) return 0;
+
+  var words = String(text).trim().split(/\s+/);
+
+  return words.length === 1 && words[0] === '' ? 0 : words.length;
+}
+
+// =============================================================================
+// LANGUAGE DETECTION
+// =============================================================================
+
+// Words common in one language and rare in the other. Spellings that are
+// ordinary words in BOTH are deliberately absent - "no", "me", "son", "van",
+// "era", "hay", "favor", "sin", "con", "ya", "he" and "has" all read as
+// Spanish to a naive matcher while being perfectly normal English, and vice
+// versa. Including them would swing short messages at random.
+var SPANISH_WORDS_ = [
+  'el', 'la', 'los', 'las', 'un', 'una', 'unos', 'unas', 'de', 'del', 'que',
+  'en', 'por', 'para', 'pero', 'como', 'cuando', 'donde', 'porque',
+  'tambien', 'muy', 'mas', 'todo', 'toda', 'todos', 'este', 'esta', 'esto',
+  'ese', 'esa', 'eso', 'mi', 'tu', 'su', 'sus', 'les', 'es', 'estoy',
+  'estamos', 'fue', 'ser', 'estar', 'tengo', 'tiene', 'tienen', 'puedo',
+  'puede', 'pueden', 'quiero', 'quiere', 'necesito', 'necesita', 'gracias',
+  'hola', 'buenos', 'buenas', 'dias', 'tardes', 'noches', 'senor', 'senora',
+  'disculpe', 'perdon', 'llamada', 'llamar', 'llame', 'mensaje', 'abogado',
+  'abogada', 'caso', 'cita', 'accidente', 'seguro', 'carro', 'trabajo',
+  'dinero', 'ayuda', 'ayudar', 'hablar', 'hable', 'saber', 'manana',
+  'ahora', 'aqui', 'si', 'bien', 'nada', 'algo', 'otro', 'otra', 'mucho',
+  'mucha', 'usted', 'ustedes', 'nosotros', 'ellos'
+];
+
+var ENGLISH_WORDS_ = [
+  'the', 'and', 'is', 'are', 'was', 'were', 'be', 'been', 'this', 'that',
+  'these', 'those', 'of', 'to', 'in', 'for', 'with', 'from', 'about', 'at',
+  'on', 'but', 'or', 'if', 'when', 'what', 'which', 'who', 'how', 'why',
+  'i', 'you', 'your', 'my', 'we', 'our', 'they', 'their', 'she', 'it',
+  'had', 'will', 'would', 'can', 'could', 'should', 'do', 'does', 'did',
+  'get', 'got', 'just', 'know', 'need', 'want', 'let', 'please', 'thanks',
+  'thank', 'hello', 'hey', 'sorry', 'yes', 'okay', 'call', 'called',
+  'calling', 'back', 'there', 'here', 'today', 'tomorrow', 'talk', 'help',
+  'time', 'case', 'lawyer', 'attorney', 'appointment', 'accident',
+  'insurance', 'work', 'money', 'good', 'morning', 'afternoon'
+];
+
+var SPANISH_LOOKUP_ = buildWordLookup_(SPANISH_WORDS_);
+var ENGLISH_LOOKUP_ = buildWordLookup_(ENGLISH_WORDS_);
+
+var LANGUAGE_CACHE_ = {};
+
+function buildWordLookup_(words) {
+  var lookup = {};
+
+  for (var i = 0; i < words.length; i++) {
+    lookup[words[i]] = true;
+  }
+
+  return lookup;
+}
+
 function detectLanguage(text) {
   if (!text || typeof text !== 'string') return '';
-  var trimmed = text.trim();
-  if (trimmed.length < 2) return '';
 
-  if (_langCache[trimmed] !== undefined) return _langCache[trimmed];
+  var cleaned = sanitizeLanguageSample_(text);
 
-  // 1. Local heuristic first — good enough for most messages, zero network
-  var result = detectLanguageHeuristic(trimmed);
-  if (result) {
-    _langCache[trimmed] = result;
-    return result;
-  }
+  if (!cleaned) return '';
+  if (LANGUAGE_CACHE_[cleaned] !== undefined) return LANGUAGE_CACHE_[cleaned];
 
-  // 2. Fall back to Google only if it hasn't been disabled
-  if (!_googleTranslateDisabled) {
-    var googleResult = detectLanguageViaGoogleTranslate(trimmed);
-    if (googleResult === null) {
-      // Network error or 429 — disable for rest of run
-      _googleTranslateDisabled = true;
-      Logger.log('Google Translate disabled for this run (rate-limited or error)');
-    } else {
-      _langCache[trimmed] = googleResult;
-      return googleResult;
-    }
-  }
+  var result = detectLanguageHeuristic(cleaned);
+  LANGUAGE_CACHE_[cleaned] = result;
 
-  _langCache[trimmed] = '';
-  return '';
+  return result;
 }
 
 /**
- * Uses the free Google Translate auto-detect endpoint.
- * No API key or billing required — same endpoint the Google Translate site uses.
- * Returns 'English', 'Spanish', '' for other languages, or null on failure.
+ * Strips content that carries no language signal - links, emails, phone
+ * numbers and digits - so a message like "call me at 512-412-1624" is judged
+ * on its words instead of its punctuation.
  */
-function detectLanguageViaGoogleTranslate(text) {
-  // Cap at 500 chars — plenty for detection, keeps the URL safe
-  var snippet = text.substring(0, 500);
-  var url = 'https://translate.googleapis.com/translate_a/single'
-          + '?client=gtx&sl=auto&tl=en&dt=t&q=' + encodeURIComponent(snippet);
-
-  try {
-    var response = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
-    if (response.getResponseCode() !== 200) {
-      Logger.log('Google Translate detect returned ' + response.getResponseCode());
-      return null;
-    }
-    // Response is a nested JSON array. The detected language code is at index [2].
-    var result = JSON.parse(response.getContentText());
-    var lang = (result[2] || '').toLowerCase();
-    if (lang === 'es') return 'Spanish';
-    if (lang === 'en') return 'English';
-    return '';
-  } catch (e) {
-    Logger.log('Google Translate detect exception: ' + e.message);
-    return null;
-  }
+function sanitizeLanguageSample_(text) {
+  return String(text)
+    .replace(/https?:\/\/\S+/gi, ' ')
+    .replace(/\S+@\S+\.\S+/g, ' ')
+    .replace(/\+?\d[\d\-().\s]{6,}\d/g, ' ')
+    .replace(/\d+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
-/**
- * Fallback keyword-based detector. Returns 'Spanish', 'English', or ''.
- */
 function detectLanguageHeuristic(text) {
-  var sample = text.toLowerCase();
+  // Inverted punctuation is unambiguous - no English text uses it.
+  if (/[¿¡]/.test(text)) return 'Spanish';
 
-  if (/[ñáéíóúü¿¡]/.test(sample)) return 'Spanish';
+  var es = countLanguageAccents_(text) * 2;
+  var en = 0;
 
-  var SPANISH = [
-    ' el ', ' la ', ' los ', ' las ', ' de ', ' que ', ' no ', ' si ',
-    ' una ', ' uno ', ' por ', ' para ', ' con ', ' sin ', ' pero ',
-    ' hola ', ' gracias ', ' buenos ', ' buenas ', ' necesito ', ' puede '
-  ];
-  var ENGLISH = [
-    ' the ', ' a ', ' an ', ' is ', ' are ', ' was ', ' and ', ' or ',
-    ' but ', ' to ', ' of ', ' in ', ' for ', ' with ', ' you ', ' your ',
-    ' hello ', ' hi ', ' thanks ', ' please ', ' call ', ' need '
-  ];
+  var words = foldAccents_(text.toLowerCase())
+    .replace(/[^a-z\s]/g, ' ')
+    .split(/\s+/);
 
-  var padded = ' ' + sample.replace(/[^\w\s]/g, ' ') + ' ';
-  var es = 0, en = 0;
-  for (var i = 0; i < SPANISH.length; i++) { if (padded.indexOf(SPANISH[i]) !== -1) es++; }
-  for (var j = 0; j < ENGLISH.length; j++) { if (padded.indexOf(ENGLISH[j]) !== -1) en++; }
+  for (var i = 0; i < words.length; i++) {
+    var word = words[i];
+
+    if (!word) continue;
+    if (SPANISH_LOOKUP_[word]) es++;
+    if (ENGLISH_LOOKUP_[word]) en++;
+  }
 
   if (es === 0 && en === 0) return '';
-  if (es > en) return 'Spanish';
-  if (en > es) return 'English';
-  return '';
+
+  // Bilingual or mixed samples are common. Require a clear margin rather than
+  // calling a near-tie, so an ambiguous contact stays blank instead of wrong.
+  if (es > 0 && en > 0) {
+    if (es >= en * 1.5) return 'Spanish';
+    if (en >= es * 1.5) return 'English';
+
+    return '';
+  }
+
+  return es > en ? 'Spanish' : 'English';
+}
+
+/**
+ * Counts accented characters that actually indicate Spanish. Accents inside
+ * capitalized words are skipped: "José García" and "Núñez" are names, and
+ * they appear just as often in an English sentence as a Spanish one.
+ */
+function countLanguageAccents_(text) {
+  var words = String(text).split(/\s+/);
+  var count = 0;
+
+  for (var i = 0; i < words.length; i++) {
+    var word = words[i];
+
+    if (!word) continue;
+    if (/^[^a-záéíóúüñ]*[A-ZÁÉÍÓÚÜÑ]/.test(word)) continue;
+
+    var hits = word.match(/[ñáéíóúü]/g);
+
+    if (hits) count += hits.length;
+  }
+
+  return count;
+}
+
+/**
+ * Maps accented characters to their plain equivalents so "días" and "dias"
+ * both match the same word list entry.
+ */
+function foldAccents_(text) {
+  return text
+    .replace(/[áàâä]/g, 'a')
+    .replace(/[éèêë]/g, 'e')
+    .replace(/[íìîï]/g, 'i')
+    .replace(/[óòôö]/g, 'o')
+    .replace(/[úùûü]/g, 'u')
+    .replace(/ñ/g, 'n');
+}
+
+// =============================================================================
+// DEBUG HELPERS
+// =============================================================================
+
+function debugContactActivityPrompt() {
+  var ui = SpreadsheetApp.getUi();
+  var response = ui.prompt('Debug Contact Activity', 'Enter the contact phone number, like +15124121624', ui.ButtonSet.OK_CANCEL);
+
+  if (response.getSelectedButton() !== ui.Button.OK) return;
+
+  debugContactActivityByPhone_(response.getResponseText());
+}
+
+function debugContactActivityByPhone_(phone) {
+  var normalizedPhone = normalizePhone(phone);
+  var phoneNumberIds = fetchAllPhoneNumberIds();
+  var userIds = fetchAllUserIds();
+
+  Logger.log('Checking phone: ' + normalizedPhone);
+  Logger.log('Quo inbox phone number IDs: ' + JSON.stringify(phoneNumberIds));
+  Logger.log('Quo user IDs: ' + JSON.stringify(userIds));
+
+  var activity = fetchActivityForContactPhones_([normalizedPhone], phoneNumberIds, userIds);
+
+  Logger.log('Total deduped calls found: ' + activity.calls.length);
+  Logger.log('Total deduped messages found: ' + activity.messages.length);
+
+  activity.calls.sort(function(a, b) {
+    return String(getCallTimestamp_(b)).localeCompare(String(getCallTimestamp_(a)));
+  });
+
+  for (var i = 0; i < activity.calls.length; i++) {
+    var c = activity.calls[i];
+
+    Logger.log('CALL ' + JSON.stringify({
+      id: c.id,
+      createdAt: c.createdAt,
+      answeredAt: c.answeredAt,
+      completedAt: c.completedAt,
+      updatedAt: c.updatedAt,
+      direction: c.direction,
+      status: c.status,
+      duration: c.duration,
+      phoneNumberId: c.phoneNumberId,
+      userId: c.userId,
+      answeredBy: c.answeredBy,
+      participants: c.participants,
+      aiHandled: c.aiHandled
+    }));
+  }
+
+  activity.messages.sort(function(a, b) {
+    return String(getMessageTimestamp_(b)).localeCompare(String(getMessageTimestamp_(a)));
+  });
+
+  for (var m = 0; m < activity.messages.length; m++) {
+    var msg = activity.messages[m];
+
+    Logger.log('MESSAGE ' + JSON.stringify({
+      id: msg.id,
+      createdAt: msg.createdAt,
+      updatedAt: msg.updatedAt,
+      direction: msg.direction,
+      userId: msg.userId,
+      phoneNumberId: msg.phoneNumberId,
+      text: msg.text
+    }));
+  }
+}
+
+function debugContactRecordPrompt() {
+  var ui = SpreadsheetApp.getUi();
+  var response = ui.prompt('Debug Contact Record', 'Enter the contact phone number, like +15124121624', ui.ButtonSet.OK_CANCEL);
+
+  if (response.getSelectedButton() !== ui.Button.OK) return;
+
+  debugContactRecordByPhone_(response.getResponseText());
+}
+
+function debugContactRecordByPhone_(phone) {
+  var normalizedPhone = normalizePhone(phone);
+  var contacts = fetchAllContacts();
+  var found = false;
+
+  Logger.log('Looking for contact record with phone: ' + normalizedPhone);
+  Logger.log('Total contacts fetched: ' + contacts.length);
+
+  for (var i = 0; i < contacts.length; i++) {
+    var contact = contacts[i];
+    var df = contact.defaultFields || {};
+    var phones = getAllPhones(df.phoneNumbers);
+    var name = ((df.firstName || '') + ' ' + (df.lastName || '')).trim();
+
+    if (phones.indexOf(normalizedPhone) !== -1) {
+      found = true;
+
+      Logger.log('CONTACT FOUND ' + JSON.stringify({
+        id: contact.id,
+        name: name,
+        company: df.company || '',
+        primaryPhone: getPrimaryPhone(df.phoneNumbers),
+        rawPhoneNumbers: df.phoneNumbers,
+        normalizedPhones: phones,
+        emails: df.emails
+      }));
+    }
+  }
+
+  if (!found) {
+    Logger.log('NO CONTACT RECORD FOUND for ' + normalizedPhone);
+  }
+}
+
+function debugLanguageSamplePrompt() {
+  var ui = SpreadsheetApp.getUi();
+  var response = ui.prompt('Debug Language Sample', 'Enter the contact phone number, like +15124121624', ui.ButtonSet.OK_CANCEL);
+
+  if (response.getSelectedButton() !== ui.Button.OK) return;
+
+  debugLanguageSampleByPhone_(response.getResponseText());
+}
+
+/**
+ * Shows every piece of contact-authored text the detector considered, which
+ * one it settled on, and the verdict. Use this when a row's language looks
+ * wrong.
+ */
+function debugLanguageSampleByPhone_(phone) {
+  var normalizedPhone = normalizePhone(phone);
+  var phoneNumberIds = fetchAllPhoneNumberIds();
+  var userIds = fetchAllUserIds();
+  var contactPhones = [normalizedPhone];
+
+  Logger.log('Language sample for: ' + normalizedPhone);
+
+  var activity = fetchActivityForContactPhones_(contactPhones, phoneNumberIds, userIds);
+  var voicemailCache = fetchVoicemailsForCalls(activity.calls);
+  var samples = collectFreeLanguageSamples_(voicemailCache, activity.messages)
+    .concat(fetchContactTranscriptSamples_(activity.calls, contactPhones));
+
+  samples.sort(function(a, b) {
+    return String(b.ts || '').localeCompare(String(a.ts || ''));
+  });
+
+  Logger.log('Contact-authored samples found: ' + samples.length);
+
+  for (var i = 0; i < samples.length; i++) {
+    Logger.log('SAMPLE ' + JSON.stringify({
+      ts: samples[i].ts,
+      source: samples[i].source,
+      words: countWords_(samples[i].text),
+      text: String(samples[i].text).substring(0, 300)
+    }));
+  }
+
+  var chosen = buildLanguageSampleForContact_(activity.calls, voicemailCache, activity.messages, contactPhones);
+
+  Logger.log('Chosen sample (' + countWords_(chosen) + ' words): ' + chosen.substring(0, 500));
+  Logger.log('Sanitized: ' + sanitizeLanguageSample_(chosen).substring(0, 500));
+  Logger.log('Detected language: ' + (detectLanguage(chosen) || '(undetermined)'));
+}
+
+function sortByRecentTime() {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  var range = sheet.getDataRange();
+
+  range.sort({
+    column: COL['Last Any Contact At'] + 1,
+    ascending: false
+  });
 }
