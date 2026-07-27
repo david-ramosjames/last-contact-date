@@ -25,7 +25,15 @@ var CONFIG = {
 
   CHUNK_SIZE: 40,
   CHUNK_DELAY_SECONDS: 30,
-  MAX_RUNTIME_MS: 4 * 60 * 1000
+  MAX_RUNTIME_MS: 4 * 60 * 1000,
+
+  // Language detection reads only what the CONTACT said or wrote: inbound
+  // texts, inbound voicemail transcripts, and the contact's own lines from
+  // call transcripts. Quo call summaries are never used - they are AI-written
+  // and always in English, so they would mark every Spanish speaker English.
+  MIN_LANGUAGE_SAMPLE_WORDS: 8,
+  MAX_LANGUAGE_SAMPLES: 5,
+  MAX_TRANSCRIPT_LOOKUPS: 3
 };
 
 var PROP_SYNC_OFFSET = 'QUO_SYNC_OFFSET';
@@ -78,10 +86,12 @@ function onOpen() {
     .createMenu('Quo Sync')
     .addItem('Sync Contacts Now', 'syncQuoContactsToSheet')
     .addItem('Sync One Contact By Phone', 'syncOneContactByPhonePrompt')
+    .addItem('Force Full Resync (Refetch Everything)', 'forceFullResyncPrompt')
     .addItem('Cancel In-Progress Sync', 'cancelQuoSync')
     .addSeparator()
     .addItem('Debug Contact Activity By Phone', 'debugContactActivityPrompt')
     .addItem('Debug Contact Record By Phone', 'debugContactRecordPrompt')
+    .addItem('Debug Language Sample By Phone', 'debugLanguageSamplePrompt')
     .addItem('Setup Sheet', 'setupSheet')
     .addToUi();
 }
@@ -92,6 +102,49 @@ function cancelQuoSync() {
   props.deleteProperty(PROP_SYNC_STARTED_AT);
   clearContinuationTriggers_();
   Logger.log('In-progress sync cancelled.');
+}
+
+/**
+ * Clears the change-detection state so the next sync refetches activity for
+ * every contact instead of skipping unchanged ones. Needed after a change to
+ * how a column is derived - otherwise contacts whose conversations have not
+ * moved keep their old values indefinitely.
+ */
+function forceFullResyncPrompt() {
+  var ui = SpreadsheetApp.getUi();
+  var sheet = setupSheet();
+  var lastRow = sheet.getLastRow();
+  var rowCount = Math.max(0, lastRow - 1);
+
+  var response = ui.alert(
+    'Force Full Resync',
+    'This clears the cached activity timestamps for ' + rowCount + ' contacts so the next ' +
+    'sync refetches all of them from scratch. Existing data stays in place until it is ' +
+    'replaced. This makes the next sync much slower. Continue?',
+    ui.ButtonSet.OK_CANCEL
+  );
+
+  if (response !== ui.Button.OK) return;
+
+  clearChangeDetectionState_(sheet);
+  ui.alert('Cleared. Run "Sync Contacts Now" to refetch every contact.');
+}
+
+function clearChangeDetectionState_(sheet) {
+  var lastRow = sheet.getLastRow();
+
+  if (lastRow >= 2) {
+    sheet.getRange(2, COL['Last Conversation Activity At'] + 1, lastRow - 1, 1).clearContent();
+  }
+
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var cacheSheet = ss.getSheetByName(CONFIG.CONVERSATION_CACHE_SHEET_NAME);
+
+  if (cacheSheet) {
+    ss.deleteSheet(cacheSheet);
+  }
+
+  Logger.log('Change-detection state cleared; next sync will refetch every contact.');
 }
 
 // =============================================================================
@@ -237,6 +290,7 @@ function buildFreshActivityRow_(contactId, name, company, primaryPhone, email, c
 
   var classified = emptyClassified_();
   var textActivity = emptyTextActivity_();
+  var languageSample = '';
 
   if (lastConversationActivityAt || contactPhones.length > 0) {
     activity = fetchActivityForContactPhones_(contactPhones, phoneNumberIds, userIds);
@@ -245,6 +299,7 @@ function buildFreshActivityRow_(contactId, name, company, primaryPhone, email, c
     var voicemailCache = fetchVoicemailsForCalls(activity.calls);
     classified = classifyCalls(activity.calls, voicemailCache);
     textActivity = computeTextActivityFromMessages(activity.messages);
+    languageSample = buildLanguageSampleForContact_(activity.calls, voicemailCache, activity.messages, contactPhones);
   }
 
   Logger.log('Latest inbound completed: ' + classified.lastCompletedInbound);
@@ -259,6 +314,7 @@ function buildFreshActivityRow_(contactId, name, company, primaryPhone, email, c
     classified,
     textActivity,
     lastConversationActivityAt,
+    languageSample,
     syncTime
   );
 }
@@ -1017,7 +1073,7 @@ function classifyCalls(calls, voicemailCache) {
 // ROW BUILDING
 // =============================================================================
 
-function buildContactRow(contactId, name, company, primaryPhone, email, classified, textActivity, lastConversationActivityAt, syncTime) {
+function buildContactRow(contactId, name, company, primaryPhone, email, classified, textActivity, lastConversationActivityAt, languageSample, syncTime) {
   var lastCompletedHumanCall = latestOf([
     classified.lastCompletedInbound,
     classified.lastCompletedOutbound
@@ -1064,14 +1120,6 @@ function buildContactRow(contactId, name, company, primaryPhone, email, classifi
     lastText,
     lastConversationActivityAt
   ]);
-
-  var languageSample = '';
-
-  if (classified.lastInboundVoicemailAt > textActivity.lastInbound) {
-    languageSample = classified.lastInboundVoicemailTranscript;
-  } else {
-    languageSample = textActivity.lastInboundText || classified.lastInboundVoicemailTranscript;
-  }
 
   var lastLanguageUsed = detectLanguage(languageSample);
   var lastContactInfo = determineLastContactType(classified, textActivity);
@@ -1257,49 +1305,307 @@ function valueToComparableString_(value) {
 }
 
 // =============================================================================
+// LANGUAGE SAMPLING
+// =============================================================================
+// Only the contact's own words count as evidence of the language they speak:
+//
+//   1. Inbound text messages          - the contact typed them
+//   2. Inbound voicemail transcripts  - the contact spoke them
+//   3. Call transcript lines spoken by the contact's phone number
+//
+// Deliberately excluded: Quo call summaries (AI-written, always English),
+// outbound texts and voicemails (our staff wrote them, usually English even
+// with Spanish-speaking clients), and transcript lines attributed to one of
+// our users.
+// =============================================================================
+
+function buildLanguageSampleForContact_(calls, voicemailCache, messages, contactPhones) {
+  var samples = collectFreeLanguageSamples_(voicemailCache, messages);
+  var sample = pickLanguageSample_(samples);
+
+  // Texts and voicemails are free - we already have them. Call transcripts
+  // cost one request each, so only reach for them when the free evidence is
+  // too thin to judge (e.g. the contact only ever replies "ok").
+  if (countWords_(sample) >= CONFIG.MIN_LANGUAGE_SAMPLE_WORDS) {
+    return sample;
+  }
+
+  var transcriptSamples = fetchContactTranscriptSamples_(calls, contactPhones);
+
+  if (transcriptSamples.length === 0) {
+    return sample;
+  }
+
+  return pickLanguageSample_(samples.concat(transcriptSamples));
+}
+
+function collectFreeLanguageSamples_(voicemailCache, messages) {
+  var samples = [];
+
+  for (var m = 0; m < messages.length; m++) {
+    var msg = messages[m];
+
+    if (normalizeDirection_(msg.direction) !== 'inbound') continue;
+    if (!msg.text) continue;
+
+    samples.push({
+      ts: getMessageTimestamp_(msg),
+      text: msg.text,
+      source: 'inbound_text'
+    });
+  }
+
+  for (var callId in voicemailCache) {
+    var vm = voicemailCache[callId];
+
+    if (normalizeDirection_(vm.direction) !== 'inbound') continue;
+    if (!vm.transcript) continue;
+
+    samples.push({
+      ts: vm.createdAt || '',
+      text: vm.transcript,
+      source: 'inbound_voicemail'
+    });
+  }
+
+  return samples;
+}
+
+function fetchContactTranscriptSamples_(calls, contactPhones) {
+  var samples = [];
+  var phoneSet = {};
+
+  for (var p = 0; p < contactPhones.length; p++) {
+    phoneSet[contactPhones[p]] = true;
+  }
+
+  var candidates = calls.slice().filter(function(call) {
+    return call.id && getCallTimestamp_(call);
+  });
+
+  candidates.sort(function(a, b) {
+    return String(getCallTimestamp_(b)).localeCompare(String(getCallTimestamp_(a)));
+  });
+
+  var lookups = Math.min(candidates.length, CONFIG.MAX_TRANSCRIPT_LOOKUPS);
+
+  for (var i = 0; i < lookups; i++) {
+    var call = candidates[i];
+    var result = quoApiFetch('/call-transcripts/' + call.id, {}, {
+      silent403: true
+    });
+
+    if (!result || !result.data || !result.data.dialogue) continue;
+
+    var dialogue = result.data.dialogue;
+    var spokenByContact = [];
+
+    for (var d = 0; d < dialogue.length; d++) {
+      var segment = dialogue[d];
+
+      // userId means one of our team members was speaking, not the contact.
+      if (segment.userId) continue;
+      if (!segment.content) continue;
+      if (!phoneSet[normalizePhone(segment.identifier)]) continue;
+
+      spokenByContact.push(segment.content);
+    }
+
+    if (spokenByContact.length > 0) {
+      samples.push({
+        ts: getCallTimestamp_(call),
+        text: spokenByContact.join(' '),
+        source: 'call_transcript'
+      });
+    }
+  }
+
+  return samples;
+}
+
+/**
+ * Picks the text to run detection on: newest evidence first, adding older
+ * samples only until there are enough words to judge confidently.
+ */
+function pickLanguageSample_(samples) {
+  var usable = samples.filter(function(s) {
+    return s.text && String(s.text).trim();
+  });
+
+  usable.sort(function(a, b) {
+    return String(b.ts || '').localeCompare(String(a.ts || ''));
+  });
+
+  var parts = [];
+  var words = 0;
+
+  for (var i = 0; i < usable.length && i < CONFIG.MAX_LANGUAGE_SAMPLES; i++) {
+    parts.push(usable[i].text);
+    words += countWords_(usable[i].text);
+
+    if (words >= CONFIG.MIN_LANGUAGE_SAMPLE_WORDS) break;
+  }
+
+  return parts.join(' ');
+}
+
+function countWords_(text) {
+  if (!text) return 0;
+
+  var words = String(text).trim().split(/\s+/);
+
+  return words.length === 1 && words[0] === '' ? 0 : words.length;
+}
+
+// =============================================================================
 // LANGUAGE DETECTION
 // =============================================================================
+
+// Words common in one language and rare in the other. Spellings that are
+// ordinary words in BOTH are deliberately absent - "no", "me", "son", "van",
+// "era", "hay", "favor", "sin", "con", "ya", "he" and "has" all read as
+// Spanish to a naive matcher while being perfectly normal English, and vice
+// versa. Including them would swing short messages at random.
+var SPANISH_WORDS_ = [
+  'el', 'la', 'los', 'las', 'un', 'una', 'unos', 'unas', 'de', 'del', 'que',
+  'en', 'por', 'para', 'pero', 'como', 'cuando', 'donde', 'porque',
+  'tambien', 'muy', 'mas', 'todo', 'toda', 'todos', 'este', 'esta', 'esto',
+  'ese', 'esa', 'eso', 'mi', 'tu', 'su', 'sus', 'les', 'es', 'estoy',
+  'estamos', 'fue', 'ser', 'estar', 'tengo', 'tiene', 'tienen', 'puedo',
+  'puede', 'pueden', 'quiero', 'quiere', 'necesito', 'necesita', 'gracias',
+  'hola', 'buenos', 'buenas', 'dias', 'tardes', 'noches', 'senor', 'senora',
+  'disculpe', 'perdon', 'llamada', 'llamar', 'llame', 'mensaje', 'abogado',
+  'abogada', 'caso', 'cita', 'accidente', 'seguro', 'carro', 'trabajo',
+  'dinero', 'ayuda', 'ayudar', 'hablar', 'hable', 'saber', 'manana',
+  'ahora', 'aqui', 'si', 'bien', 'nada', 'algo', 'otro', 'otra', 'mucho',
+  'mucha', 'usted', 'ustedes', 'nosotros', 'ellos'
+];
+
+var ENGLISH_WORDS_ = [
+  'the', 'and', 'is', 'are', 'was', 'were', 'be', 'been', 'this', 'that',
+  'these', 'those', 'of', 'to', 'in', 'for', 'with', 'from', 'about', 'at',
+  'on', 'but', 'or', 'if', 'when', 'what', 'which', 'who', 'how', 'why',
+  'i', 'you', 'your', 'my', 'we', 'our', 'they', 'their', 'she', 'it',
+  'had', 'will', 'would', 'can', 'could', 'should', 'do', 'does', 'did',
+  'get', 'got', 'just', 'know', 'need', 'want', 'let', 'please', 'thanks',
+  'thank', 'hello', 'hey', 'sorry', 'yes', 'okay', 'call', 'called',
+  'calling', 'back', 'there', 'here', 'today', 'tomorrow', 'talk', 'help',
+  'time', 'case', 'lawyer', 'attorney', 'appointment', 'accident',
+  'insurance', 'work', 'money', 'good', 'morning', 'afternoon'
+];
+
+var SPANISH_LOOKUP_ = buildWordLookup_(SPANISH_WORDS_);
+var ENGLISH_LOOKUP_ = buildWordLookup_(ENGLISH_WORDS_);
+
+var LANGUAGE_CACHE_ = {};
+
+function buildWordLookup_(words) {
+  var lookup = {};
+
+  for (var i = 0; i < words.length; i++) {
+    lookup[words[i]] = true;
+  }
+
+  return lookup;
+}
 
 function detectLanguage(text) {
   if (!text || typeof text !== 'string') return '';
 
-  return detectLanguageHeuristic(text);
+  var cleaned = sanitizeLanguageSample_(text);
+
+  if (!cleaned) return '';
+  if (LANGUAGE_CACHE_[cleaned] !== undefined) return LANGUAGE_CACHE_[cleaned];
+
+  var result = detectLanguageHeuristic(cleaned);
+  LANGUAGE_CACHE_[cleaned] = result;
+
+  return result;
+}
+
+/**
+ * Strips content that carries no language signal - links, emails, phone
+ * numbers and digits - so a message like "call me at 512-412-1624" is judged
+ * on its words instead of its punctuation.
+ */
+function sanitizeLanguageSample_(text) {
+  return String(text)
+    .replace(/https?:\/\/\S+/gi, ' ')
+    .replace(/\S+@\S+\.\S+/g, ' ')
+    .replace(/\+?\d[\d\-().\s]{6,}\d/g, ' ')
+    .replace(/\d+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 function detectLanguageHeuristic(text) {
-  var sample = text.toLowerCase();
+  // Inverted punctuation is unambiguous - no English text uses it.
+  if (/[¿¡]/.test(text)) return 'Spanish';
 
-  if (/[ñáéíóúü¿¡]/.test(sample)) return 'Spanish';
-
-  var SPANISH = [
-    ' el ', ' la ', ' los ', ' las ', ' de ', ' que ', ' no ', ' si ',
-    ' una ', ' uno ', ' por ', ' para ', ' con ', ' sin ', ' pero ',
-    ' hola ', ' gracias ', ' buenos ', ' buenas ', ' necesito ', ' puede '
-  ];
-
-  var ENGLISH = [
-    ' the ', ' a ', ' an ', ' is ', ' are ', ' was ', ' and ', ' or ',
-    ' but ', ' to ', ' of ', ' in ', ' for ', ' with ', ' you ', ' your ',
-    ' hello ', ' hi ', ' thanks ', ' please ', ' call ', ' need '
-  ];
-
-  var padded = ' ' + sample.replace(/[^\w\s]/g, ' ') + ' ';
-  var es = 0;
+  var es = countLanguageAccents_(text) * 2;
   var en = 0;
 
-  for (var i = 0; i < SPANISH.length; i++) {
-    if (padded.indexOf(SPANISH[i]) !== -1) es++;
-  }
+  var words = foldAccents_(text.toLowerCase())
+    .replace(/[^a-z\s]/g, ' ')
+    .split(/\s+/);
 
-  for (var j = 0; j < ENGLISH.length; j++) {
-    if (padded.indexOf(ENGLISH[j]) !== -1) en++;
+  for (var i = 0; i < words.length; i++) {
+    var word = words[i];
+
+    if (!word) continue;
+    if (SPANISH_LOOKUP_[word]) es++;
+    if (ENGLISH_LOOKUP_[word]) en++;
   }
 
   if (es === 0 && en === 0) return '';
-  if (es > en) return 'Spanish';
-  if (en > es) return 'English';
 
-  return '';
+  // Bilingual or mixed samples are common. Require a clear margin rather than
+  // calling a near-tie, so an ambiguous contact stays blank instead of wrong.
+  if (es > 0 && en > 0) {
+    if (es >= en * 1.5) return 'Spanish';
+    if (en >= es * 1.5) return 'English';
+
+    return '';
+  }
+
+  return es > en ? 'Spanish' : 'English';
+}
+
+/**
+ * Counts accented characters that actually indicate Spanish. Accents inside
+ * capitalized words are skipped: "José García" and "Núñez" are names, and
+ * they appear just as often in an English sentence as a Spanish one.
+ */
+function countLanguageAccents_(text) {
+  var words = String(text).split(/\s+/);
+  var count = 0;
+
+  for (var i = 0; i < words.length; i++) {
+    var word = words[i];
+
+    if (!word) continue;
+    if (/^[^a-záéíóúüñ]*[A-ZÁÉÍÓÚÜÑ]/.test(word)) continue;
+
+    var hits = word.match(/[ñáéíóúü]/g);
+
+    if (hits) count += hits.length;
+  }
+
+  return count;
+}
+
+/**
+ * Maps accented characters to their plain equivalents so "días" and "dias"
+ * both match the same word list entry.
+ */
+function foldAccents_(text) {
+  return text
+    .replace(/[áàâä]/g, 'a')
+    .replace(/[éèêë]/g, 'e')
+    .replace(/[íìîï]/g, 'i')
+    .replace(/[óòôö]/g, 'o')
+    .replace(/[úùûü]/g, 'u')
+    .replace(/ñ/g, 'n');
 }
 
 // =============================================================================
@@ -1413,6 +1719,55 @@ function debugContactRecordByPhone_(phone) {
   if (!found) {
     Logger.log('NO CONTACT RECORD FOUND for ' + normalizedPhone);
   }
+}
+
+function debugLanguageSamplePrompt() {
+  var ui = SpreadsheetApp.getUi();
+  var response = ui.prompt('Debug Language Sample', 'Enter the contact phone number, like +15124121624', ui.ButtonSet.OK_CANCEL);
+
+  if (response.getSelectedButton() !== ui.Button.OK) return;
+
+  debugLanguageSampleByPhone_(response.getResponseText());
+}
+
+/**
+ * Shows every piece of contact-authored text the detector considered, which
+ * one it settled on, and the verdict. Use this when a row's language looks
+ * wrong.
+ */
+function debugLanguageSampleByPhone_(phone) {
+  var normalizedPhone = normalizePhone(phone);
+  var phoneNumberIds = fetchAllPhoneNumberIds();
+  var userIds = fetchAllUserIds();
+  var contactPhones = [normalizedPhone];
+
+  Logger.log('Language sample for: ' + normalizedPhone);
+
+  var activity = fetchActivityForContactPhones_(contactPhones, phoneNumberIds, userIds);
+  var voicemailCache = fetchVoicemailsForCalls(activity.calls);
+  var samples = collectFreeLanguageSamples_(voicemailCache, activity.messages)
+    .concat(fetchContactTranscriptSamples_(activity.calls, contactPhones));
+
+  samples.sort(function(a, b) {
+    return String(b.ts || '').localeCompare(String(a.ts || ''));
+  });
+
+  Logger.log('Contact-authored samples found: ' + samples.length);
+
+  for (var i = 0; i < samples.length; i++) {
+    Logger.log('SAMPLE ' + JSON.stringify({
+      ts: samples[i].ts,
+      source: samples[i].source,
+      words: countWords_(samples[i].text),
+      text: String(samples[i].text).substring(0, 300)
+    }));
+  }
+
+  var chosen = buildLanguageSampleForContact_(activity.calls, voicemailCache, activity.messages, contactPhones);
+
+  Logger.log('Chosen sample (' + countWords_(chosen) + ' words): ' + chosen.substring(0, 500));
+  Logger.log('Sanitized: ' + sanitizeLanguageSample_(chosen).substring(0, 500));
+  Logger.log('Detected language: ' + (detectLanguage(chosen) || '(undetermined)'));
 }
 
 function sortByRecentTime() {
